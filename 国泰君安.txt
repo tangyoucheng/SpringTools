@@ -1,0 +1,30 @@
+{----- 1. 参数与基础变量定义 -----}
+N:=20;
+P:=2;
+
+{----- 2. 加权布林线部分（引入成交量加权 VWMA） -----}
+W_MID:=(SUM(CLOSE*VOL,N)/SUM(VOL,N));
+W_STD:=SQRT(SUM(VOL*(CLOSE-W_MID)*(CLOSE-W_MID),N)/SUM(VOL,N));
+
+{输出加权布林线三条轨}
+加权中轨:W_MID,COLORWHITE,LINETHICK1;
+加权上轨:W_MID + P*W_STD,COLORYELLOW,LINETHICK1;
+加权下轨:W_MID - P*W_STD,COLORMAGENTA,LINETHICK1;
+
+{----- 3. TD九转序列部分 -----}
+A1:=C<REF(C,4);
+A2:=BARSLASTCOUNT(A1);
+A4:=A2=9;
+
+B1:=C>REF(C,4);
+B2:=BARSLASTCOUNT(B1);
+B4:=B2=9;
+
+{在K线上下方标注1-9的数字}
+DRAWNUMBER(A2>0 AND A2<=9,L*0.99,A2),COLORGREEN; {买入结构显示绿色数字}
+DRAWNUMBER(B2>0 AND B2<=9,H*1.01,B2),COLORRED;   {卖出结构显示红色数字}
+
+{----- 4. 时空共振信号增强提示 -----}
+{当出现9且刺穿布林线边界时，图标特别提醒}
+DRAWICON(A4 AND L<=加权下轨,L*0.97,1);  {低吸共振：买入9+跌破下轨，显示红脸/红箭头}
+DRAWICON(B4 AND H>=加权上轨,H*1.03,2);  {高抛共振：卖出9+突破上轨，显示绿脸/绿箭头}
