@@ -1,0 +1,150 @@
+import datetime
+import akshare as ak
+import numpy as np
+import pandas as pd
+
+
+def get_latest_trading_day(df_daily):
+    """根据日线数据，自动判断并返回最新已收盘的历史交易日（T日）和未开盘/进行中的未来交易日（T+1日）"""
+    # 确保日期列为字符串格式 'YYYY-MM-DD'
+    df_daily["日期"] = pd.to_datetime(df_daily["日期"]).dt.strftime("%Y-%m-%d")
+
+    # 获取当前系统时间的北京时间日期（此处直接取系统日期，回测时可根据需要调整）
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    # 将所有交易日转化为列表，过滤掉未来未发生的交易日（防止数据源里含有超前预期数据）
+    past_trading_days = df_daily[df_daily["日期"] <= today_str]["日期"].tolist()
+
+    if not past_trading_days:
+        raise ValueError("无法在日线数据中定位有效的历史交易日。")
+
+    # 1. 确定上一个已收盘的交易日（T日）
+    # 如果今天还没收盘(比如上午或周末)，那么最新已结束的交易日就是 past_trading_days 的倒数第一个
+    # 如果今天已经收盘且今天本身就是交易日，通常直接用今天作为已知日计算明天
+    t_date = past_trading_days[-1]
+
+    # 2. 确定未来的交易日（T+1日）
+    all_days = df_daily["日期"].tolist()
+    t_idx = all_days.index(t_date)
+
+    if t_idx == len(all_days) - 1:
+        # 说明T日已经是日线数据的最后一天，未来交易日还没产生
+        future_date = None
+    else:
+        future_date = all_days[t_idx + 1]
+
+    return t_date, future_date
+
+
+def calculate_future_cdp_by_current_time(stock_code="600519", bin_size=0.5):
+    """自动获取当前系统时间，动态向前推算最近的已收盘交易日，
+
+    抓取其分时数据计算出下一个未来交易日的 POC-CDP 预测值。
+    """
+    print(f" 正在初始化【{stock_code}】的实时动态对齐系统...")
+
+    # 1. 抓取该股票的历史日线数据
+    df_daily = ak.stock_zh_a_hist(
+        symbol=stock_code, period="daily", adjust="qfq"
+    )
+
+    # 2. 核心改良：自动推算临近交易日
+    try:
+        target_date, future_date = get_latest_trading_day(df_daily)
+    except Exception as e:
+        print(f"❌ 自动推算交易日失败: {e}")
+        return
+
+    print(f" 当前系统时间推算成功：")
+    print(f" └─ 上一个已收盘交易日 (T日数据源)  : {target_date}")
+    if future_date:
+        print(f" └─ 推算预测的目标交易日 (T+1未来) : {future_date}")
+    else:
+        print(f" └─ 推算预测的目标交易日 (T+1未来) : 下一个即将开盘的交易日")
+
+    # 3. 抓取已知交易日(target_date)全天的 1 分钟分时 K 线
+    print(
+        f"\n正在抓取数据源日 [{target_date}] 的全天分时数据以提取 POC 筹码分布..."
+    )
+    try:
+        df_min = ak.stock_zh_a_hist_min_em(
+            symbol=stock_code, period="1", adjust="qfq"
+        )
+        df_min["date_str"] = pd.to_datetime(df_min["时间"]).dt.strftime(
+            "%Y-%m-%d"
+        )
+
+        # 筛选出已知交易日当天的数据
+        df_target_day = df_min[df_min["date_str"] == target_date].copy()
+
+        if df_target_day.empty:
+            print(
+                f"❌ 未能提取到 {target_date} 当天的分时数据。可能由于接口历史限制，请尝试盘中或收盘后运行。"
+            )
+            return
+
+        # 4. 运行 POC 众数筹码算法
+        day_high = df_target_day["最高"].max()
+        day_low = df_target_day["最低"].min()
+
+        # 划分价格桶并计算直方图
+        bins = np.arange(
+            df_target_day["收盘"].min() - bin_size,
+            df_target_day["收盘"].max() + bin_size * 2,
+            bin_size,
+        )
+        counts, bin_edges = np.histogram(
+            df_target_day["收盘"], bins=bins, weights=df_target_day["成交量"]
+        )
+
+        # 找出筹码峰对应的价格 (POC)
+        max_idx = np.argmax(counts)
+        poc_price = (bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2
+
+        # 5. 派生下一个未来交易日的阻力与支撑
+        nh_poc = 2 * poc_price - day_low
+        nl_poc = 2 * poc_price - day_high
+
+        # 6. 打印输出预测报告
+        print("\n" + "=" * 50)
+        print(f" 🔮 【基于 {target_date} 筹码预测未来交易日空间】")
+        print("=" * 50)
+        print(f" 明日前瞻中轴线 (POC) : {poc_price:.2f} 元")
+        print(f" 预测高抛阻力位 (NH)        : {nh_poc:.2f} 元")
+        print(f" 预测低吸支撑位 (NL)        : {nl_poc:.2f} 元")
+        print("=" * 50)
+
+        # 7. 如果未来交易日已经收盘，自动调取真实走势进行比对
+        if future_date:
+            df_future_row = df_daily[df_daily["日期"] == future_date].iloc[0]
+            future_real_high = df_future_row["最高"]
+            future_real_low = df_future_row["最低"]
+
+            print(f" 📊 【目标交易日 {future_date} 真实走势实证比对】")
+            print(
+                f" 真实最高价 : {future_real_high:.2f} 元  (预测阻力 NH: {nh_poc:.2f})"
+            )
+            print(
+                f" 真实最低价 : {future_real_low:.2f} 元  (预测支撑 NL: {nl_poc:.2f})"
+            )
+            print("=" * 50)
+
+            if future_real_low <= nl_poc <= future_real_high:
+                print(" 🟢 实证反馈：价格触及或跌破了支撑位 NL 并拉回，【低吸信号成功】！")
+            if future_real_low <= nh_poc <= future_real_high:
+                print(" 🔴 实证反馈：价格冲高触及了阻力位 NH，【高抛信号成功】！")
+        else:
+            print(
+                f" 💡 提示：下一个未来交易日尚未收盘，请在下一个交易日开盘后，观察真实价格是否在 NL({nl_poc:.2f}) 到 NH({nh_poc:.2f}) 之间高抛低吸。"
+            )
+
+    except Exception as e:
+        print(f"❌ 计算流程中断: {e}")
+
+
+# ==========================================
+# 测试运行（直接运行即可，自动对齐当前系统时间）
+# ==========================================
+if __name__ == "__main__":
+    # 以贵州茅台为例，格子精度设为 0.5 元
+    calculate_future_cdp_by_current_time(stock_code="600519", bin_size=0.5)
