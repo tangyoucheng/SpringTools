@@ -1,7 +1,13 @@
+import os
+import sys
+#使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import datetime  # 导入时间处理库，用于盘中实时获取系统当前时钟
 import numpy as np  # 导入数学计算库，用于高阶直方图切片与矩阵运算
 import pandas as pd  # 导入数据处理工具，用于盘中表格类数据整理
 import yfinance as yf  # 导入雅虎财经接口，用于免登录秒级获取盘中1分钟分时数据
+from CDP_poc_config import stock_dict
 
 
 def run_intraday_single_grid(df_today, ratio, base_price):
@@ -25,6 +31,13 @@ def run_intraday_single_grid(df_today, ratio, base_price):
 
 
 def calculate_realtime_multi_grid_poc(stock_ticker="688037.SS"):
+    # 使用 split('.') 切割字符串，[0] 表示只取点前面的纯数字部分
+    pure_code = stock_ticker.split('.')[0]
+    stock_name = stock_dict.get(
+        pure_code,
+        "未知股票"
+    )
+    
     """【盘中智能监控核心函数】
 
     实时抓取今天开盘(09:30)到运行该脚本那一刻的分时数据，建立4层网格进行交叉风控审计，锁定盘中真正的动态POC。
@@ -38,9 +51,9 @@ def calculate_realtime_multi_grid_poc(stock_ticker="688037.SS"):
 
     print(f"🚀【实时监控启动】当前北京时间: {current_time_str}")
     print(
-        f"【系统日志】正在紧急提取【{stock_ticker}】今日开盘(09:30)至当下的盘中高频分时筹码..."
+        f"【系统日志】正在紧急提取【{stock_ticker}{stock_name}】今日开盘(09:30)至当下的盘中高频分时筹码..."
     )
-
+    
     # ==========================================
     # 第一步：下载最近1天(今天)的1分钟高频分时数据包
     # ==========================================
@@ -115,8 +128,10 @@ def calculate_realtime_multi_grid_poc(stock_ticker="688037.SS"):
     true_cdp = (intraday_high + intraday_low + 2 * final_poc) / 4
 
     # 衍生接下来盘中多空博弈的极限位置
+    ah_poc = true_cdp + (intraday_high - intraday_low)  # 动态日内追多压力位
     nh_poc = 2 * true_cdp - intraday_low  # 动态日内高抛压力位
     nl_poc = 2 * true_cdp - intraday_high  # 动态日内低吸支撑位
+    al_poc = true_cdp - (intraday_high - intraday_low)  # 动态日内止损支撑位
 
     # ==========================================
     # 第五步：打印盘中动态实时量化前瞻报告
@@ -127,7 +142,7 @@ def calculate_realtime_multi_grid_poc(stock_ticker="688037.SS"):
     print(f"【风控审计结论】: {audit_status}")
 
     print("\n" + "⚡" * 13 + " 盘中多网格智能投票确定看板 " + "⚡" * 13)
-    print(f" 监控标的代码 : {stock_ticker}")
+    print(f" 监控标的代码和名称 : {stock_ticker}{stock_name}")
     print(
         f" 盘中当前最新价 : {intraday_latest_price:.2f} 元  (最高: {intraday_high:.2f} | 最低: {intraday_low:.2f})"
     )
@@ -144,6 +159,12 @@ def calculate_realtime_multi_grid_poc(stock_ticker="688037.SS"):
     )
     print(
         f" 🟢 下一个买盘支撑低吸点 (动态NL) : {nl_poc:.2f} 元  <-- 盘中回调至此如果起稳，适合低吸"
+    )
+    print(
+        f" 🚀 极罕见三期共振突破点 (动态AH) : {ah_poc:.2f} 元  <-- 盘中放量干穿此位，空间彻底打开，可右侧追多"
+    )
+    print(
+        f" 💀 终极铁律生命止损线 (动态AL) : {al_poc:.2f} 元  <-- 盘中若不幸跌破此生死线，必须无条件清仓离场"
     )
     print("=" * 65)
 
@@ -164,4 +185,23 @@ def calculate_realtime_multi_grid_poc(stock_ticker="688037.SS"):
 if __name__ == "__main__":
     # 以你的20CM高动能科技芯片股为例
     # 哪怕今天盘中它再次拉出20CM涨停或巨震开板，这套4网格系统都能在盘中瞬间辨别出主力真伪成本
-    calculate_realtime_multi_grid_poc(stock_ticker="688037.SS")
+    #calculate_realtime_multi_grid_poc(stock_ticker="688037.SS")
+    stock_codes = list(stock_dict.keys())
+    for stock_code in stock_codes:
+        # 转换为字符串，防止原数据是数字类型
+        stock_code = str(stock_code)
+        
+        # 判断是否已经带了后缀，如果没有，则根据规则拼接
+        if not (stock_code.endswith('.SS') or stock_code.endswith('.SZ')):
+            # 科创板(688..)和沪市主板(60..)拼接 .SS，其余（如创业板300..）拼接 .SZ
+            if stock_code.startswith(('688', '60')):
+                full_code = f"{stock_code}.SS"
+            else:
+                full_code = f"{stock_code}.SZ"
+        else:
+            full_code = stock_code
+            
+        print(f"处理后的 yfinance 完整代码：{full_code}")
+        # 传入你的 CDP 计算函数
+        calculate_realtime_multi_grid_poc(stock_ticker=full_code)
+    
