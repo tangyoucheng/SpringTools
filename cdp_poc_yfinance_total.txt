@@ -1,7 +1,13 @@
+import os
+import sys
+#使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import datetime  # 导入时间处理库，用于精准对齐北京时间与历史日期
 import numpy as np  # 导入数学计算库，主要用于直方图切片与矩阵运算
 import pandas as pd  # 导入数据处理工具，量化分析核心的表格类工具
 import yfinance as yf  # 导入雅虎财经接口，用于免登录极速下载全球股票高频分时数据
+from CDP_poc_config import stock_dict
 
 
 def get_clean_single_day_data(stock_ticker, target_date_str):
@@ -58,7 +64,7 @@ def run_single_grid_calculation(df_period, target_dates_pool, ratio, base_price)
 
 def calculate_history_multi_grid_cdp(
     stock_ticker="688037.SS", target_date="2026-07-20", lookback_days=3
-):
+):   
     """【智能决策核心函数】在指定的历史周期内，同时跑4个网格，通过少数服从多数确定最终唯一的靠谱POC。"""
     # 1. 下载低频日线时间轴（不受限制），用来摸清历史上真实的交易日顺序
     ticker = yf.Ticker(stock_ticker)
@@ -140,16 +146,20 @@ def calculate_history_multi_grid_cdp(
     latest_low = df_target_day_data["Low"].min()
 
     true_cdp = (latest_high + latest_low + 2 * final_poc) / 4
+    ah_poc = true_cdp + (latest_high - latest_low)
     nh_poc = 2 * true_cdp - latest_low
     nl_poc = 2 * true_cdp - latest_high
+    al_poc = true_cdp - (latest_high - latest_low)
 
     # 返回最终确定的唯一核心买卖点字典，并附带审计日志
     return {
         "lookback": lookback_days,
         "POC": final_poc,
         "CDP": true_cdp,
+        "AL": al_poc,
         "NL": nl_poc,
         "NH": nh_poc,
+        "AH": ah_poc,
         "status": audit_status,
         "matrix": poc_results,
     }
@@ -160,63 +170,83 @@ def calculate_history_multi_grid_cdp(
 # ==========================================
 if __name__ == "__main__":
     # 继续以测试的科创板高价高动能股“中芯国际 (688037.SS)”为例
-    ticker = "688037.SS"
+    #ticker = "688037.SS"
+    stock_codes = list(stock_dict.keys())
+    for stock_code in stock_codes:
+        # 转换为字符串，防止原数据是数字类型
+        stock_code = str(stock_code)
+        
+        # 判断是否已经带了后缀，如果没有，则根据规则拼接
+        if not (stock_code.endswith('.SS') or stock_code.endswith('.SZ')):
+            # 科创板(688..)和沪市主板(60..)拼接 .SS，其余（如创业板300..）拼接 .SZ
+            if stock_code.startswith(('688', '60')):
+                full_code = f"{stock_code}.SS"
+            else:
+                full_code = f"{stock_code}.SZ"
+        else:
+            full_code = stock_code
 
-    # 🔍 【智能时间系统配置】：你可以选择以下【两种模式】中的任意一种
-    # 模式一：固定抽取历史上某一个你想复盘的特定日期（比如下面这一行）
-    my_target_date = "2026-07-20"
+        stock_name = stock_dict.get(
+            stock_code,
+            "未知股票"
+        )  
 
-    # 模式二：【直接使用当前系统时间】（如果你想盘中或每天收盘下午3:30直接运行，请把下面4行注释解开）
-    # now_bj = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
-    # current_time_str = now_bj.strftime("%H:%M:%S")
-    # # 如果今天没收盘(早于15:05)，自动往前用昨天的日期作为T日；过了15:05，则大方直接采用今天
-    # my_target_date = now_bj.strftime("%Y-%m-%d") if current_time_str >= "15:05:00" else (now_bj - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        # 🔍 【智能时间系统配置】：你可以选择以下【两种模式】中的任意一种
+        # 模式一：固定抽取历史上某一个你想复盘的特定日期（比如下面这一行）
+        #my_target_date = "2026-07-20"
 
-    print("🚀 【智能投票多网格 - 历史多周期抽取系统启动】 🚀")
-    print(f" 当前锁定的核心抽取基准日 (T日): {my_target_date}")
-    print(
-        "【安全日志】后台正在并发建立【万分之五、千分之一、千分之二、千分之五】四层独立网格防噪机制...\n"
-    )
+        # 模式二：【直接使用当前系统时间】（如果你想盘中或每天收盘下午3:30直接运行，请把下面4行注释解开）
+        now_bj = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+        current_time_str = now_bj.strftime("%H:%M:%S")
+        # # 如果今天没收盘(早于15:05)，自动往前用昨天的日期作为T日；过了15:05，则大方直接采用今天
+        my_target_date = now_bj.strftime("%Y-%m-%d") if current_time_str >= "15:05:00" else (now_bj - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # 依次抽取 1天、3天、5天模型。每个周期内部都会独立进行 4次网格交叉审计与投票
-    res_1d = calculate_history_multi_grid_cdp(
-        stock_ticker=ticker, target_date=my_target_date, lookback_days=1
-    )
-    res_3d = calculate_history_multi_day_cdp = calculate_history_multi_grid_cdp(
-        stock_ticker=ticker, target_date=my_target_date, lookback_days=3
-    )
-    res_5d = calculate_history_multi_day_cdp = calculate_history_multi_grid_cdp(
-        stock_ticker=ticker, target_date=my_target_date, lookback_days=5
-    )
+        print("🚀 【智能投票多网格 - 历史多周期抽取系统启动】 🚀")
+        print(f" 当前锁定的核心抽取基准日 (T日): {my_target_date}")
+        print(
+            "【安全日志】后台正在并发建立【万分之五、千分之一、千分之二、千分之五】四层独立网格防噪机制...\n"
+        )
 
-    # ==========================================
-    # 打印最终的终极量化比对与风控裁决看板
-    # ==========================================
-    if res_1d and res_3d and res_5d:
-        print("\n" + "🛡️" * 12 + f" 【{my_target_date}】多网格智能裁决过程复盘 " + "🛡️" * 12)
-        print(f"【1天周期审计日志】: {res_1d['status']}")
-        print(f"【3天周期审计日志】: {res_3d['status']}")
-        print(f"【5天周期审计日志】: {res_5d['status']}")
+        # 依次抽取 1天、3天、5天模型。每个周期内部都会独立进行 4次网格交叉审计与投票
+        res_1d = calculate_history_multi_grid_cdp(
+            stock_ticker=full_code, target_date=my_target_date, lookback_days=1
+        )
+        res_3d = calculate_history_multi_day_cdp = calculate_history_multi_grid_cdp(
+            stock_ticker=full_code, target_date=my_target_date, lookback_days=3
+        )
+        res_5d = calculate_history_multi_day_cdp = calculate_history_multi_grid_cdp(
+            stock_ticker=full_code, target_date=my_target_date, lookback_days=5
+        )
 
-        print("\n" + "🏁" * 15 + f" 【{my_target_date}】多周期量化终判对齐看板 " + "🏁" * 15)
-        print("-" * 75)
-        print(
-            "周期天数\t| 智能确定的真实POC\t| 中轴(CDP)\t| 低吸支撑(NL)\t| 高抛阻力(NH)"
-        )
-        print("-" * 75)
-        print(
-            f"1天历史\t| {res_1d['POC']:.2f}\t\t| {res_1d['CDP']:.2f}\t| {res_1d['NL']:.2f}\t| {res_1d['NH']:.2f}"
-        )
-        print(
-            f"3天历史\t| {res_3d['POC']:.2f}\t\t| {res_3d['CDP']:.2f}\t| {res_3d['NL']:.2f}\t| {res_3d['NH']:.2f}"
-        )
-        print(
-            f"5天历史\t| {res_5d['POC']:.2f}\t\t| {res_5d['CDP']:.2f}\t| {res_5d['NL']:.2f}\t| {res_5d['NH']:.2f}"
-        )
-        print("=" * 75)
-        print(
-            "💡 实战核心：系统已经自动帮您扫清了日内由于游资突发爆量对倒带来的价格欺骗，"
-        )
-        print(
-            "   如果1天、3天、5天的【低吸支撑NL】收敛在同一个窄幅价格区间，该区域即为多周期铁底，触及可分批买入。"
-        )
+        # ==========================================
+        # 打印最终的终极量化比对与风控裁决看板
+        # ==========================================
+        if res_1d and res_3d and res_5d:
+            print("\n" + "🛡️" * 12 + f" 【{my_target_date}】多网格智能裁决过程复盘 " + "🛡️" * 12)
+            print(f" 监控标的代码和名称 : {full_code} {stock_name}")
+            print(f"【1天周期审计日志】: {res_1d['status']}")
+            print(f"【3天周期审计日志】: {res_3d['status']}")
+            print(f"【5天周期审计日志】: {res_5d['status']}")
+
+            print("\n" + "🏁" * 15 + f" 【{my_target_date}】多周期量化终判对齐看板 " + "🏁" * 15)
+            print("-" * 15)
+            print(
+                "周期天数\t| 智能确定的真实POC\t| 中轴(CDP)\t| 止损边界 (AL)\t| 低吸支撑(NL)\t| 高抛阻力(NH)\t| 追多边界 (AH)"
+            )
+            print("-" * 75)
+            print(
+                f"1天历史\t| {res_1d['POC']:.2f}\t\t| {res_1d['CDP']:.2f}\t| {res_1d['AL']:.2f}\t| {res_1d['NL']:.2f}\t| {res_1d['NH']:.2f}\t| {res_1d['AH']:.2f}"
+            )
+            print(
+                f"3天历史\t| {res_3d['POC']:.2f}\t\t| {res_3d['CDP']:.2f}\t| {res_1d['AL']:.2f}\t| {res_3d['NL']:.2f}\t| {res_3d['NH']:.2f}\t| {res_1d['AH']:.2f}"
+            )
+            print(
+                f"5天历史\t| {res_5d['POC']:.2f}\t\t| {res_5d['CDP']:.2f}\t| {res_1d['AL']:.2f}\t| {res_3d['NL']:.2f}\t| {res_3d['NH']:.2f}\t| {res_1d['AH']:.2f}"
+            )
+            print("=" * 75)
+            print(
+                "💡 实战核心：系统已经自动帮您扫清了日内由于游资突发爆量对倒带来的价格欺骗，"
+            )
+            print(
+                "   如果1天、3天、5天的【低吸支撑NL】收敛在同一个窄幅价格区间，该区域即为多周期铁底，触及可分批买入。"
+            )
