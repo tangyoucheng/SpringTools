@@ -1,0 +1,222 @@
+import datetime  # 导入时间处理库
+import numpy as np  # 导入数学计算库
+import pandas as pd  # 导入数据处理库
+import yfinance as yf  # 导入雅虎财经接口
+
+
+def calculate_multi_day_decay_poc_cdp(
+    stock_ticker="600519.SS", lookback_days=3, ratio=0.0005
+):
+    """【多天筹码叠加衰减版】核心策略脚本
+
+    通过参数调节过去N个交易日的筹码，并进行时间衰减叠加，计算出更稳健的CDP系统。
+
+    :param stock_ticker: 股票代码（如 "600519.SS"）
+    :param lookback_days: 回溯的交易日天数（可自由调节，如 1, 3, 5, 10 等）
+    :param bin_size: 筹码价格桶的精度（单位：元）
+    :ratio: 系数 ratio=0.0005 代表万分之五（0.05%），  如果看5天模型，可以在调用时传入 ratio=0.001 (0.1%)
+    """
+    print(
+        f"\n【系统日志】开始计算【{stock_ticker}】的 {lookback_days} 天筹码叠加衰减模型..."
+    )
+
+    # ==========================================
+    # 第一步：向数据源下载足够长的历史分时数据包
+    # ==========================================
+    ticker = yf.Ticker(stock_ticker)
+    # 为了防止遇到节假日导致数据不够，我们多下载一些天数（回溯天数 + 5天）
+    #download_days = lookback_days + 5
+    # 雅虎服务器有一个死规定：每次请求 1分钟精细度的数据时，历史时间跨度最多只能允许 8 天
+    if lookback_days == 1:
+        download_days = 3  # 看1天，下载最近3天即可（覆盖周末）
+    elif lookback_days <= 3:
+        download_days = 5  # 看3天，下载最近5天
+    else:
+        download_days = 7  # 极限看5天，下载最近7天（雅虎1分钟K线的极限安全位置）
+    df_min = ticker.history(period=f"{download_days}d", interval="1m")
+
+    if df_min.empty:
+        print("❌【错误】无法获取网络数据，请检查网络。")
+        return None
+
+    # 提取序列中最后一根K线的最新价格作为参考基准价
+    base_price = df_min['Close'].iloc[-1]
+    
+    # 【动态计算核心】根据当前股价，自动算出最适合这只股票的筹码格子宽度
+    bin_size = base_price * ratio
+    
+    # 打印一下，让你在控制台能看到系统当前自动选用了多大的格子
+    print(f" └─ 动态自适应系统启动：当前基准价 {base_price:.2f}元，自动匹配筹码格子宽度(bin_size)为: {bin_size:.3f}元")
+    
+
+    # 将时间统一转换为北京时间，并提取年月日字符串
+    df_min["date_str"] = df_min.index.tz_convert("Asia/Shanghai").strftime(
+        "%Y-%m-%d"
+    )
+
+    # ==========================================
+    # 第二步：【智能时钟】确定哪些日期属于合格的“历史回溯池”
+    # ==========================================
+    all_available_dates = sorted(
+        df_min["date_str"].unique()
+    )  # 获取排序后的所有日期
+    now_bj = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=8))
+    )
+    current_time_str = now_bj.strftime("%H:%M:%S")
+    today_str = now_bj.strftime("%Y-%m-%d")
+
+    # 判断今天是否已经收盘
+    if current_time_str >= "15:05:00":
+        # 已收盘：把今天也算作合法的历史数据源
+        valid_history_dates = all_available_dates
+        print(f" └─ 当前时间 {current_time_str}（已收盘），包含今天。")
+    else:
+        # 未收盘：严格剔除今天，只保留今天之前的历史日期
+        valid_history_dates = [d for d in all_available_dates if d < today_str]
+        print(
+            f" └─ 当前时间 {current_time_str}（未收盘），已剔除今天未完成的数据。"
+        )
+
+    # 根据用户设置的 lookback_days，截取最近的 N 个有效交易日
+    if len(valid_history_dates) < lookback_days:
+        print(
+            f"⚠️【警告】提取到的有效交易日不足 {lookback_days} 天，将使用最大可用天数（{len(valid_history_dates)}天）。"
+        )
+        target_dates_pool = valid_history_dates
+    else:
+        # 截取最后（即最近）的 N 天
+        target_dates_pool = valid_history_dates[-lookback_days:]
+
+    print(f" └─ 锁定参与筹码计算的交易日池: {target_dates_pool}")
+
+    # ==========================================
+    # 第三步：多天筹码的大融合与“时间衰减因子”计算
+    # ==========================================
+    # 确定全历史周期的最高价和最低价，用来建立一个覆盖多天全局的“大筹码价格桶”
+    df_period = df_min[df_min["date_str"].isin(target_dates_pool)]
+    global_high = df_period["High"].max()
+    global_low = df_period["Low"].min()
+
+    # 建立全局价格格子边界
+    bins = np.arange(
+        df_period["Close"].min() - bin_size,
+        df_period["Close"].max() + bin_size * 2,
+        bin_size,
+    )
+    # 初始化一个空数组，用来累加多天衰减后的总成交量
+    combined_counts = np.zeros(len(bins) - 1)
+
+    # 遍历每一天，计算其自身的成交量直方图，并乘上衰减系数
+    # 线性衰减逻辑：假设看3天，最近的一天权重为3，次近为2，最远为1
+    total_days = len(target_dates_pool)
+
+    for index, date in enumerate(target_dates_pool):
+        # 计算这一天的“时间衰减权重”（从 1 开始，最后一天即最近的一天权重最高，等于 total_days）
+        weight = index + 1
+
+        # 过滤出单天的数据
+        df_single_day = df_min[df_min["date_str"] == date]
+
+        # 计算这一天单日的成交量分布
+        counts, _ = np.histogram(
+            df_single_day["Close"],
+            bins=bins,
+            weights=df_single_day["Volume"],
+        )
+
+        # 【核心衰减叠加】将这一天的成交量乘上权重后，累加到大筹码桶中
+        combined_counts += counts * weight
+
+    # ==========================================
+    # 第四步：寻找多天衰减叠加后的终极筹码峰 (Multi-Day POC)
+    # ==========================================
+    max_idx = np.argmax(combined_counts)
+    multi_poc_price = (bins[max_idx] + bins[max_idx + 1]) / 2
+
+    # ==========================================
+    # 第五步：运行 2倍多天POC加权 CDP 公式
+    # ==========================================
+    # 注意：这里的最高和最低，我们使用距离今天最近的那一个单日的最高最低（因为交战边界应由最新一天决定）
+    latest_day_df = df_min[df_min["date_str"] == target_dates_pool[-1]]
+    latest_high = latest_day_df["High"].max()
+    latest_low = latest_day_df["Low"].min()
+
+    # 核心除以4公式
+    true_cdp = (latest_high + latest_low + 2 * multi_poc_price) / 4
+
+    # 第六步：派生空间五关价
+    nh_poc = 2 * true_cdp - latest_low
+    nl_poc = 2 * true_cdp - latest_high
+    ah_poc = true_cdp + (latest_high - latest_low)
+    al_poc = true_cdp - (latest_high - latest_low)
+
+    # ==========================================
+    # 第七步：打印对比报告
+    # ==========================================
+    print("=" * 50)
+    print(f" 📊 【{lookback_days}天衰减模型前瞻预测报告】")
+    print("=" * 50)
+    print(f" 终极衰减筹码峰(POC) : {multi_poc_price:.2f} 元")
+    print(f" 预测加权中轴 (CDP)  : {true_cdp:.2f} 元")
+    print(f" 预测日内高抛点 (NH)  : {nh_poc:.2f} 元")
+    print(f" 预测日内低吸点 (NL)  : {nl_poc:.2f} 元")
+    print(f" 强势追多边界   (AH)  : {ah_poc:.2f} 元")
+    print(f" 破位止损边界   (AL)  : {al_poc:.2f} 元")
+    print("=" * 50)
+
+    # 返回结果字典，便于后续进行多周期横向数据比对
+    return {
+        "lookback": lookback_days,
+        "POC": multi_poc_price,
+        "CDP": true_cdp,
+        "AH": ah_poc,
+        "NH": nh_poc,
+        "NL": nl_poc,
+        "AL": al_poc,
+    }
+
+
+# ==========================================
+# 横向多周期比对测试入口
+# ==========================================
+if __name__ == "__main__":
+    # 在雅虎财经的代码为 600519.SS 贵州茅台
+    # 在雅虎财经的代码为 688037.SS 芯源微
+    ticker = "688037.SS"  
+    grid_size = 0.0005  # 动态计算格子大小：取当天开盘价（或昨日收盘价）的 0.05%
+
+    print("🚀 【量化多周期对比系统启动】 🚀")
+
+    # 1. 运行 1 天模型（等同于之前的单日模式）
+    res_1d = calculate_multi_day_decay_poc_cdp(
+        stock_ticker=ticker, lookback_days=1, ratio=grid_size
+    )
+
+    # 2. 运行 3 天衰减模型
+    res_3d = calculate_multi_day_decay_poc_cdp(
+        stock_ticker=ticker, lookback_days=3, ratio=0.001
+    )
+
+    # 3. 运行 5 天衰减模型
+    res_5d = calculate_multi_day_decay_poc_cdp(
+        stock_ticker=ticker, lookback_days=5, ratio=0.001
+    )
+
+    # 4. 终极横向比对看板
+    print("\n" + "🏁" * 15 + " 多周期横向比对看板 " + "🏁" * 15)
+    print("周期天数\t| 筹码峰(POC)\t| 中轴(CDP)\t| 止损边界 (AL)\t| 低吸支撑(NL)\t| 高抛阻力(NH)\t| 追多边界 (AH)")
+    print("-" * 75)
+    print(
+        f"1天模型\t| {res_1d['POC']:.2f}\t| {res_1d['CDP']:.2f}\t| {res_1d['AL']:.2f}\t| {res_1d['NL']:.2f}\t| {res_1d['NH']:.2f}\t| {res_1d['AH']:.2f}"
+    )
+    print(
+        f"3天衰减\t| {res_3d['POC']:.2f}\t| {res_3d['CDP']:.2f}\t| {res_1d['AL']:.2f}\t| {res_3d['NL']:.2f}\t| {res_3d['NH']:.2f}\t| {res_1d['AH']:.2f}"
+    )
+    print(
+        f"5天衰减\t| {res_5d['POC']:.2f}\t| {res_5d['CDP']:.2f}\t| {res_1d['AL']:.2f}\t| {res_5d['NL']:.2f}\t| {res_5d['NH']:.2f}\t| {res_1d['AH']:.2f}"
+    )
+    print("=" * 75)
+    print(
+        "💡 提示：如果1天、3天、5天的【低吸支撑NL】非常接近，说明该位置是多重周期的‘共振强支撑’，胜率极高！"
+    )
