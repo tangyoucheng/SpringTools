@@ -1,0 +1,167 @@
+import datetime  # 导入时间处理库，用于盘中实时获取系统当前时钟
+import numpy as np  # 导入数学计算库，用于高阶直方图切片与矩阵运算
+import pandas as pd  # 导入数据处理工具，用于盘中表格类数据整理
+import yfinance as yf  # 导入雅虎财经接口，用于免登录秒级获取盘中1分钟分时数据
+
+
+def run_intraday_single_grid(df_today, ratio, base_price):
+    """【底层组件】传入特定格子比例系数，跑盘中单次直方图计算，输出当前的实时价格。"""
+    bin_size = base_price * ratio  # 根据当前盘中现价动态计算格子厚度
+    # 建立覆盖今天开盘以来所有波动范围的价格网格（Bins）
+    bins = np.arange(
+        df_today["Close"].min() - bin_size,
+        df_today["Close"].max() + bin_size * 2,
+        bin_size,
+    )
+
+    # 统计今天开盘至此时此刻，每个格子里堆积的总成交量
+    counts, bin_edges = np.histogram(
+        df_today["Close"], bins=bins, weights=df_today["Volume"]
+    )
+
+    # 找出成交量最高的那一个格子的索引，返回其中心绝对价格
+    max_idx = np.argmax(counts)
+    return (bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2
+
+
+def calculate_realtime_multi_grid_poc(stock_ticker="688037.SS"):
+    """【盘中智能监控核心函数】
+
+    实时抓取今天开盘(09:30)到运行该脚本那一刻的分时数据，建立4层网格进行交叉风控审计，锁定盘中真正的动态POC。
+    """
+    # 动态获取当前的北京时间与年月日
+    now_bj = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=8))
+    )
+    today_str = now_bj.strftime("%Y-%m-%d")
+    current_time_str = now_bj.strftime("%H:%M:%S")
+
+    print(f"🚀【实时监控启动】当前北京时间: {current_time_str}")
+    print(
+        f"【系统日志】正在紧急提取【{stock_ticker}】今日开盘(09:30)至当下的盘中高频分时筹码..."
+    )
+
+    # ==========================================
+    # 第一步：下载最近1天(今天)的1分钟高频分时数据包
+    # ==========================================
+    ticker = yf.Ticker(stock_ticker)
+    df_min = ticker.history(period="1d", interval="1m")
+
+    if df_min.empty:
+        print(
+            "❌【错误】未能获取到今日盘中数据。可能原因：还未到 09:30 开盘时间，或今日停牌。"
+        )
+        return
+
+    # 对齐北京时间，格式化日期
+    df_min["date_str"] = df_min.index.tz_convert("Asia/Shanghai").strftime(
+        "%Y-%m-%d"
+    )
+
+    # 精准切出今天的K线数据（彻底排除时区导致的跨天死数据）
+    df_today = df_min[df_min["date_str"] == today_str].copy()
+
+    if df_today.empty:
+        # 安全退防逻辑：如果今天是周末或者清晨尚未开盘，则自动获取系统里最新能够提供的那个有效交易日
+        latest_date = df_min["date_str"].max()
+        print(
+            f"⚠️【提示】检测到当前不处于交易时段，系统自动为您展示最新有效交易日({latest_date})全天的实时筹码："
+        )
+        df_today = df_min[df_min["date_str"] == latest_date].copy()
+
+    # 提取开盘到此时此刻，盘中已经发生过的最高价、最低价和最新现价
+    intraday_high = df_today["High"].max()
+    intraday_low = df_today["Low"].min()
+    intraday_latest_price = df_today["Close"].iloc[-1]  # 最新盘中现价
+
+    # ==========================================
+    # 第二步：建立 4 大经典网格矩阵矩阵进行盘中实时多维扫描
+    # ==========================================
+    ratios = {
+        "万分之五 (极细)": 0.0005,
+        "千分之一 (标准)": 0.0010,
+        "千分之二 (防噪)": 0.0020,
+        "千分之五 (趋势)": 0.0050,
+    }
+
+    # 一口气把当前盘中的 4 个格子对应的实时价格全部算出来
+    poc_results = {}
+    for name, ratio in ratios.items():
+        poc_results[name] = run_intraday_single_grid(
+            df_today, ratio, intraday_latest_price
+        )
+
+    # ==========================================
+    # 第三步：🤖 智能裁决系统（盘中防噪声骗线审计）
+    # ==========================================
+    p_0005 = poc_results["万分之五 (极细)"]
+    p_0020 = poc_results["千分之二 (防噪)"]
+
+    # 审计标准：如果在此时此刻，盘中高精度的“极细网格”和具备合并抱团能力的“防噪网格”价差超过了 2%
+    # 说明在今天开盘以来的某分钟内，出现了突发对倒爆量的孤立单，导致细格子在盘中被瞬间致盲
+    if abs(p_0005 - p_0020) / p_0020 > 0.02:
+        final_poc = p_0020  # 自动触发盘中熔断，强制采信粗网格合并后的真实主战场
+        audit_status = (
+            f"🚨 盘中拦截异常脉冲！细格子失真({p_0005:.2f})，系统强制启动防噪网格"
+        )
+    else:
+        final_poc = p_0005  # 如果价差很小，说明盘中多空交火很干净，使用最精准的细网格
+        audit_status = "🟢 盘中筹码吻合共振，多空真实交火，采信高精度极细网格"
+
+    # ==========================================
+    # 第四步：运行盘中动态 2倍实时POC加权 CDP 公式
+    # ==========================================
+    # 结合盘中实时发生过的最高最低价，算出一个“活的”、随着主力挂单动态移动的智能化中轴线
+    true_cdp = (intraday_high + intraday_low + 2 * final_poc) / 4
+
+    # 衍生接下来盘中多空博弈的极限位置
+    nh_poc = 2 * true_cdp - intraday_low  # 动态日内高抛压力位
+    nl_poc = 2 * true_cdp - intraday_high  # 动态日内低吸支撑位
+
+    # ==========================================
+    # 第五步：打印盘中动态实时量化前瞻报告
+    # ==========================================
+    print("\n" + "⚙️" * 14 + " 盘中多网格矩阵实时审计复盘 " + "⚙️" * 14)
+    for name, val in poc_results.items():
+        print(f" ├─ 实时网格【{name}】 算出的动态 POC : {val:.2f} 元")
+    print(f"【风控审计结论】: {audit_status}")
+
+    print("\n" + "⚡" * 13 + " 盘中多网格智能投票确定看板 " + "⚡" * 13)
+    print(f" 监控标的代码 : {stock_ticker}")
+    print(
+        f" 盘中当前最新价 : {intraday_latest_price:.2f} 元  (最高: {intraday_high:.2f} | 最低: {intraday_low:.2f})"
+    )
+    print("-" * 65)
+    print(
+        f" 📈 裁决确定的主力主战场 (最终POC) : {final_poc:.2f} 元 (此时此刻真正的量价密集区)"
+    )
+    print(
+        f" ⚙️ 动态盘中加权中轴线 (实时CDP) : {true_cdp:.2f} 元"
+    )
+    print("-" * 65)
+    print(
+        f" 🔴 下一个动能减退高抛点 (动态NH) : {nh_poc:.2f} 元  <-- 盘中反弹至此如果量能衰竭，适合高抛"
+    )
+    print(
+        f" 🟢 下一个买盘支撑低吸点 (动态NL) : {nl_poc:.2f} 元  <-- 盘中回调至此如果起稳，适合低吸"
+    )
+    print("=" * 65)
+
+    # 给出简易的实时盘中强弱位置提示
+    if intraday_latest_price >= final_poc:
+        print(
+            f"💡 智能实盘提示：当前股价运行在真成本主战场({final_poc:.2f})之上，多头完全控盘，可继续持股多单。"
+        )
+    else:
+        print(
+            f"💡 智能实盘提示：当前股价跌破了真成本主战场({final_poc:.2f})，筹码转为上方沉重压力，短线需戒备回调风险。"
+        )
+
+
+# ==========================================
+# 盘中测试入口
+# ==========================================
+if __name__ == "__main__":
+    # 以你的20CM高动能科技芯片股为例
+    # 哪怕今天盘中它再次拉出20CM涨停或巨震开板，这套4网格系统都能在盘中瞬间辨别出主力真伪成本
+    calculate_realtime_multi_grid_poc(stock_ticker="688037.SS")
