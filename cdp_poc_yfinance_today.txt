@@ -1,0 +1,146 @@
+import datetime  # 导入时间处理库
+import numpy as np  # 导入数学计算库
+import pandas as pd  # 导入数据处理库
+import yfinance as yf  # 导入雅虎财经接口
+
+
+def calculate_intraday_realtime_poc(stock_ticker="688037.SS", ratio=0.0005):
+    """【盘中实时当日 POC 脚本】
+
+    实时抓取今天开盘(09:30)到运行该脚本那一刻的分时数据，计算当前最新筹码峰。
+
+    :param stock_ticker: 股票代码（如 "688037.SS"）
+    :param bin_size: 筹码价格桶精度（个股波幅大时设 0.2 或 0.1 元）
+    :ratio: 系数 ratio=0.0005 代表万分之五（0.05%），  如果看5天模型，可以在调用时传入 ratio=0.001 (0.1%)
+    """
+    # 动态获取当前的北京时间
+    now_bj = datetime.datetime.now(
+        datetime.timezone(datetime.timedelta(hours=8))
+    )
+    today_str = now_bj.strftime("%Y-%m-%d")
+    current_time_str = now_bj.strftime("%H:%M:%S")
+
+    print(f"🚀【实时监控】当前北京时间: {current_time_str}")
+    print(
+        f"【系统日志】正在紧急提取【{stock_ticker}】今天开盘(09:30)至当下的盘中每分钟分时筹码..."
+    )
+
+    # ==========================================
+    # 第一步：只下载最近 1 天(今天)的分时数据
+    # ==========================================
+    ticker = yf.Ticker(stock_ticker)
+    # interval="1m" 确保拿到最新鲜的、每分钟更新一次的盘中数据
+    df_min = ticker.history(period="1d", interval="1m")
+
+    if df_min.empty:
+        print(
+            "❌【错误】未能获取到今日盘中数据。可能原因：还未到 09:30 开盘时间，或今日停牌。"
+        )
+        return
+
+    # 提取序列中最后一根K线的最新价格作为参考基准价
+    base_price = df_min['Close'].iloc[-1]
+    
+    # 【动态计算核心】根据当前股价，自动算出最适合这只股票的筹码格子宽度
+    bin_size = base_price * ratio
+    
+    # 打印一下，让你在控制台能看到系统当前自动选用了多大的格子
+    print(f" └─ 动态自适应系统启动：当前基准价 {base_price:.2f}元，自动匹配筹码格子宽度(bin_size)为: {bin_size:.3f}元")
+
+    # 将数据时间对齐转换为北京时间
+    df_min["date_str"] = df_min.index.tz_convert("Asia/Shanghai").strftime(
+        "%Y-%m-%d"
+    )
+
+    # ==========================================
+    # 第二步：数据切片，精准锁定今天开盘到此时此刻的数据
+    # ==========================================
+    # 确保只取今天的 K 线（防止由于跨时区产生昨天尾盘的数据干扰）
+    df_today = df_min[df_min["date_str"] == today_str].copy()
+
+    if df_today.empty:
+        # 如果今天是交易日但还没开盘，或者今天是非交易日，则自动获取雅虎能提供的最新一天的数据
+        latest_date = df_min["date_str"].max()
+        print(
+            f"⚠️【提示】未能在系统中检测到今天({today_str})的开盘数据，可能处于非交易时段。"
+        )
+        print(f"系统将自动为你展示最新一个有效交易日({latest_date})全天的实时筹码状态：")
+        df_today = df_min[df_min["date_str"] == latest_date].copy()
+
+    # 提取开盘到此时此刻，盘中已经发生过的最高价和最低价
+    intraday_high = df_today["High"].max()
+    intraday_low = df_today["Low"].min()
+    intraday_latest_price = df_today["Close"].iloc[-1]  # 获取盘中的最新现价
+
+    # ==========================================
+    # 第三步：运行动态直方图，寻找此时此刻的实时筹码峰 (Real-time POC)
+    # ==========================================
+    # 建立覆盖盘中波动范围的价格格子
+    bins = np.arange(
+        df_today["Close"].min() - bin_size,
+        df_today["Close"].max() + bin_size * 2,
+        bin_size,
+    )
+
+    # 绑定盘中每分钟的价格和成交量进行累加
+    counts, bin_edges = np.histogram(
+        df_today["Close"], bins=bins, weights=df_today["Volume"]
+    )
+
+    # 寻找当前堆积沙子最高的桶
+    max_idx = np.argmax(counts)
+    realtime_poc = (bin_edges[max_idx] + bin_edges[max_idx + 1]) / 2
+
+    # ==========================================
+    # 第四步：运行 2倍实时POC加权 CDP 公式
+    # ==========================================
+    # 用盘中动态的最高、最低和最新的实时POC，算出一个“活的”动态中轴线
+    true_cdp = (intraday_high + intraday_low + 2 * realtime_poc) / 4
+
+    # 派生接下来盘中要面对的阻力与支撑
+    nh_poc = 2 * true_cdp - intraday_low  # 动态高抛压力位
+    nl_poc = 2 * true_cdp - intraday_high  # 动态低吸支撑位
+
+    # ==========================================
+    # 第五步：打印盘中动态实时量化前瞻报告
+    # ==========================================
+    print("\n" + "⚡" * 15 + " 当日盘中动态筹码监控看板 " + "⚡" * 15)
+    print(f" 监控标的代码 : {stock_ticker}")
+    print(
+        f" 盘中当前最新价 : {intraday_latest_price:.2f} 元  (最高: {intraday_high:.2f} | 最低: {intraday_low:.2f})"
+    )
+    print("-" * 65)
+    print(
+        f" 📈 此时此刻主力主战场 (动态POC) : {realtime_poc:.2f} 元 (开盘至此成交最集中的价格)"
+    )
+    print(
+        f" ⚙️ 动态盘中加权中轴线 (实时CDP) : {true_cdp:.2f} 元"
+    )
+    print("-" * 65)
+    print(
+        f" 🔴 盘中接下来的高抛压力 (动态NH) : {nh_poc:.2f} 元  <-- 股价反抽到这附近如果量能衰竭，可考虑高抛"
+    )
+    print(
+        f" 🟢 盘中接下来的低吸支撑 (动态NL) : {nl_poc:.2f} 元  <-- 股价回调到这附近如果企稳，可考虑低吸"
+    )
+    print("=" * 65)
+
+    # 给出简易的盘中位置提示
+    if intraday_latest_price >= realtime_poc:
+        print(
+            f"💡 实盘当前状态：当前现价运行在 POC 筹码峰({realtime_poc:.2f})之上，多头控盘，多单可继续持有。"
+        )
+    else:
+        print(
+            f"💡 实盘当前状态：当前现价跌破了 POC 筹码峰({realtime_poc:.2f})，筹码转为上方压力，短线需防范回调。"
+        )
+
+
+# ==========================================
+# 盘中测试入口
+# ==========================================
+if __name__ == "__main__":
+    # 芯片股盘中跳动快，格子建议设窄一点（如0.1元或0.2元）
+    # 在雅虎财经的代码为 600519.SS 贵州茅台
+    # 在雅虎财经的代码为 688037.SS 芯源微
+    calculate_intraday_realtime_poc(stock_ticker="688037.SS", ratio=0.0005)
