@@ -9,7 +9,7 @@ import yfinance as yf
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 假设 stock_dict 从配置中导入，若本地测试可自行定义
-from CDP_poc_config import stock_dict
+from CDP_poc_config import stock_dict, OUTPUT_END_DATE
 
 # 导入上面写好的核心逻辑组件
 from cdp_poc_total_ATR import execute_all_period_pipeline
@@ -42,7 +42,8 @@ if __name__ == "__main__":
         # 🤖 核心新增功能测试：在此指定你想截至的历史具体日期 (格式必须为 "YYYY-MM-DD")
         # 如果您想偶尔直接看今天最新的收盘价，请无条件将其【置为 None】(例如: CHOSEN_END_DATE = None)
         #CHOSEN_END_DATE = None  
-        CHOSEN_END_DATE = "2026-07-21"  
+        #CHOSEN_END_DATE = "2026-07-21"
+        CHOSEN_END_DATE = OUTPUT_END_DATE        
         
         print(f"🏁 全周期 ATR 自适应量化引擎已启动...")
         if CHOSEN_END_DATE is not None:
