@@ -1,0 +1,144 @@
+import os
+import sys
+import datetime
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# 使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 假设 stock_dict 从配置中导入，若本地测试可自行定义
+from CDP_poc_config import stock_dict
+
+# 导入上面写好的核心逻辑组件
+from cdp_poc_total_ATR import execute_all_period_pipeline
+
+if __name__ == "__main__":
+    # =========================================================================
+    # 🚨 【测试控制台核心变量配置区】
+    # =========================================================================
+    #target_stock = "688037.SS"  # 监控标的：芯源微
+    stock_codes = list(stock_dict.keys())
+    for stock_code in stock_codes:
+        # 转换为字符串，防止原数据是数字类型
+        stock_code = str(stock_code)
+        
+        # 判断是否已经带了后缀，如果没有，则根据规则拼接
+        if not (stock_code.endswith('.SS') or stock_code.endswith('.SZ')):
+            # 科创板(688..)和沪市主板(60..)拼接 .SS，其余（如创业板300..）拼接 .SZ
+            if stock_code.startswith(('688', '60')):
+                target_stock = f"{stock_code}.SS"
+            else:
+                target_stock = f"{stock_code}.SZ"
+        else:
+            target_stock = stock_code
+
+        stock_name = stock_dict.get(
+            stock_code,
+            "未知股票"
+        )  
+    
+        # 🤖 核心新增功能测试：在此指定你想截至的历史具体日期 (格式必须为 "YYYY-MM-DD")
+        # 如果您想偶尔直接看今天最新的收盘价，请无条件将其【置为 None】(例如: CHOSEN_END_DATE = None)
+        CHOSEN_END_DATE = "2026-07-21"  
+        
+        print(f"🏁 全周期 ATR 自适应量化引擎已启动...")
+        if CHOSEN_END_DATE is not None:
+            print(f"📡 当前模式：指定历史复盘回测模式 | 精准截至日期锁死为: {CHOSEN_END_DATE}")
+        else:
+            print(f"📡 当前模式：盘中最新系统时钟模式 | 数据截止点: 伴随当天收盘线动态对齐")
+
+        # 1. 动态生成数据下载的时空切片边界
+        now_clock = datetime.datetime.now()
+        if CHOSEN_END_DATE is not None:
+            target_end_dt = datetime.datetime.strptime(CHOSEN_END_DATE, "%Y-%m-%d")
+            start_date_past = target_end_dt - datetime.timedelta(days=400)
+            # yfinance下载终点不包当天，所以推后1天
+            download_end_dt = target_end_dt + datetime.timedelta(days=1)
+        else:
+            target_end_dt = now_clock
+            start_date_past = target_end_dt - datetime.timedelta(days=400)
+            download_end_dt = target_end_dt
+
+        # 2. 抓取多日大周期历史日线数据
+        print(f"📡 正在调取 {target_stock} 交易所底仓K线流数据...")
+        df_daily_raw = yf.download(target_stock, start=start_date_past, end=download_end_dt, interval="1d", progress=False)
+        
+        if df_daily_raw.empty:
+            print(f"🚨 错误：未能获取到历史日K线数据，请检查网络或更换标的代码！")
+            sys.exit(0)
+        
+        # 强力剥离多重索引列外壳，绝杀一切维度过载报错
+        if isinstance(df_daily_raw.columns, pd.MultiIndex):
+            df_daily_raw.columns = df_daily_raw.columns.get_level_values(0)
+        
+        # 格式化日期，生成算法循环所需的时间衰减池 date_str 列
+        df_daily_raw['date_str'] = df_daily_raw.index.strftime("%Y-%m-%d")
+
+        # 3. 抓取当日高频分时数据
+        if CHOSEN_END_DATE is not None:
+            # 复盘历史时，抓取指定日当天的 1分钟 极细分时图进行完全还原
+            df_intraday_raw = yf.download(target_stock, start=CHOSEN_END_DATE, end=download_end_dt, interval="1m", progress=False)
+        else:
+            # 实时最新情况，下载当前最新一天的 1分钟 分时
+            df_intraday_raw = yf.download(target_stock, period="1d", interval="1m", progress=False)
+        
+        if isinstance(df_intraday_raw.columns, pd.MultiIndex):
+            df_intraday_raw.columns = df_intraday_raw.columns.get_level_values(0)
+        
+        # 【安全防御网】万一 yfinance 因为历史久远查不到当天的 1M 分时图，自动执行单日降维模拟，防引擎崩溃
+        if df_intraday_raw.empty:
+            print(f"🚨 提示：该截止日期分时图已过期，系统自动触发降维保护，切片日线最后一日数据充当虚拟分时流")
+            last_row = df_daily_raw.iloc[-1]
+            last_close_val = float(np.array(last_row['Close']).flatten()[0])
+            minutes_sim = 240
+            sim_closes = last_close_val + np.cumsum(np.random.normal(0, 0.5, minutes_sim))
+            sim_closes[100:105] = last_close_val * 0.85
+            df_intraday_raw = pd.DataFrame({
+                "Close": sim_closes, "High": sim_closes + 0.2, "Low": sim_closes - 0.2,
+                "Volume": np.random.randint(1000, 5000, minutes_sim)
+            })
+
+        # 提取基准价格，彻底杜绝 Series/ravel 维度报错
+        fallback_base_price = float(np.array(df_daily_raw['Close'].iloc[-1]).flatten()[0])
+
+        # 4. 驱动多周期并发扫描核心大循环
+        periods_pool = [1, 3, 5, 20, 60, 120, 250]
+        results_board = {}
+        
+        for days in periods_pool:
+            if days == 1:
+                # 1天短线单日分时：传入对应分时表格，日期池传空，并实时透传用户指定的截止时间
+                results_board[days] = execute_all_period_pipeline(
+                    target_stock, df_intraday_raw, [], df_period_days=1, base_price=fallback_base_price, end_date_str=CHOSEN_END_DATE
+                )
+            else:
+                # 多日宏观大周期：截取对应天数的日K线切片传入
+                df_slice = df_daily_raw.iloc[-days:]
+                sub_dates_pool = df_slice["date_str"].tolist()
+                results_board[days] = execute_all_period_pipeline(
+                    target_stock, df_slice, sub_dates_pool, df_period_days=days, base_price=fallback_base_price, end_date_str=CHOSEN_END_DATE
+                )
+
+        # 5. 工业级多周期终判对齐战略总看板打印
+        print("\n" + "🛡️"*12 + " 全周期量化终判对齐审计复盘 " + "🛡️"*12)
+        for days in periods_pool:
+            print(f"【{days}天线周期审计日志】: {results_board[days]['audit_status']}")
+            
+        log_date_str = CHOSEN_END_DATE if CHOSEN_END_DATE is not None else now_clock.strftime('%Y-%m-%d')
+        print("\n" + "🏁" * 15 + f" 【{log_date_str}】全周期量化终判对齐战略总看板 " + "🏁" * 15)
+        header = f"{'周期类型':<14} | {'智能审定真POC':<12} | {'中轴(CDP)':<10} | {'止损边界(AL)':<10} | {'低吸支撑(NL)':<10} | {'高抛阻力(NH)':<10} | {'追多边界(AH)':<10}"
+        print("-" * 115)
+        print(header)
+        print("-" * 115)
+        
+        for days in periods_pool:
+            res = results_board[days]
+            if days <= 5:
+                name_str = f"{days}天短线历史"
+            else:
+                name_str = f"20日线(月度)" if days==20 else (f"60日线(季度)" if days==60 else (f"120日线(半年)" if days==120 else f"250日线(年度)"))
+                
+            print(f"{name_str:<16} | {res['final_poc']:<16.2f} | {res['true_cdp']:<12.2f} | {res['al_poc']:<14.2f} | {res['nl_poc']:<14.2f} | {res['nh_poc']:<14.2f} | {res['ah_poc']:<12.2f}")
+        print("=" * 115)
