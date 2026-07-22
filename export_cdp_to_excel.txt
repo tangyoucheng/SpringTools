@@ -11,7 +11,7 @@ def export_cdp_to_excel(
     stock_metrics_high_p,  # 最高价
     stock_metrics_low_p,  # 最低价
     end_date,
-    template_path="CDP_poc_stock_temple.xlsm",
+    template_path="export_cdp_poc_stock_temple.xlsm",
 ):
     """将股票基本数据与CDP/POC数据无缝写入Excel模板，并在A1输出end_date"""
 
