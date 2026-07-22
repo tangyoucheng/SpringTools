@@ -1,0 +1,92 @@
+=========================================================================
+【第一套：全周期战略总看板引擎 —— 算法设计白皮书】
+一、 历史波动率标尺抽取算法 (fetch_dynamic_atr)
+	1. 时间戳与收盘审计：
+		获取当前系统时钟 T_now。如果 T_now 处于交易日 15:00 之前，判定当天日K线未闭合、数据残缺，必须强制通过时间切片扔掉当天数据，将历史日线数据源截断至前一交易日（T-1）；如果过了 15:00，则保留当天完整K线。
+	2. 工业级 ATR 计算：
+		调取截断后的 N 天（默认14天）历史日线序列。
+		计算每日真实波幅（True Range，简称 TR）：
+		TR = max( (High - Low), abs(High - Close_prev), abs(Low - Close_prev) )
+		采用自适应移动平均（RMA算法，平滑系数 alpha = 1 / period）对 TR 序列进行平滑，求得最新一天的 ATR 绝对值。
+		将此值作为今日所有矩阵计算的固定“自适应波动率硬标尺”（命名为 base_atr）。
+二、 全周期多级网格分配算法决策树
+	1. 根据输入的历史天数变量（df_period_days），动态切换 ATR 比例系数：
+		当天数等于 1 时，ratios 为：极细 0.05倍 ATR，标准 0.125倍 ATR，防噪 0.25倍 ATR，趋势 0.60倍 ATR。
+		当天数等于 3 时，ratios 为：极细 0.10倍 ATR，标准 0.20倍 ATR，防噪 0.40倍 ATR，趋势 1.00倍 ATR。
+		当天数等于 5 时，ratios 为：极细 0.15倍 ATR，标准 0.30倍 ATR，防噪 0.60倍 ATR，趋势 1.50倍 ATR。
+		当天数等于 20 时，ratios 为：极细 0.25倍 ATR，标准 0.50倍 ATR，防噪 1.00倍 ATR，趋势 2.00倍 ATR。
+		当天数等于 60 时，ratios 为：极细 0.50倍 ATR，标准 1.00倍 ATR，防噪 1.50倍 ATR，趋势 3.00倍 ATR。
+		当天数等于 120 时，ratios 为：极细 0.80倍 ATR，标准 1.50倍 ATR，防噪 2.50倍 ATR，趋势 5.00倍 ATR。
+		当天数大于等于 250 时，ratios 为：极细 1.00倍 ATR，标准 2.00倍 ATR，防噪 4.00倍 ATR，趋势 8.00倍 ATR。
+三、 线性时间衰减宏观筹码直方图算法 (run_single_grid_calculation)
+	1. 格子宽度锁定：
+		bin_size = base_atr * atr_multiplier。设定 0.01 元为 A股 最小变动单位兜底线。
+	2. 宏观价格网格构建：
+		以 df_period 全周期最低价减去 5倍 bin_size 为起点，以全周期最高价加上 5倍 bin_size 为终点，按 bin_size 为递增步长建立全局价格网格。
+	3. 线性时间衰减累加：
+		遍历历史日期池 target_dates_pool。
+		计算每日权重：Weight = index + 1（ index 从 0 开始增加，日期越新，权重越高）。
+		将每日的 Close 价格按对应 Volume 作为 weights 投入固定价格网格，算出单日直方图 counts。
+		执行加权合并：combined_counts = sum(单日counts * Weight)。
+	4. 筹码峰提取：
+		寻找 combined_counts 数组中数值最大的索引（max_idx），计算并返回该网格的中心价格：(bins[max_idx] + bins[max_idx + 1]) / 2。
+		四、 智能裁决系统与多级熔断审计 (execute_all_period_pipeline)
+	1. 阶梯式熔断阈值分级树：
+		周期天数小于等于 5 日时，审计容忍度上限为 0.20 * base_atr。
+		周期天数在 6 日到 20 日之间时，审计容忍度上限为 0.40 * base_atr。
+		周期天数大于 20 日时，审计容忍度上限为 0.80 * base_atr。
+	2. 拦截审计：
+		如果 abs( 极细网格价格 - 防噪网格价格 ) > 审计容忍度上限，判定高频格子失真，系统强制触发盘中熔断，最终采信防噪网格价格（final_poc = 防噪网格价格）。
+		否则，判定筹码吻合共振，采信高精度极细价格（final_poc = 极细网格价格）。
+五、 2倍 POC 加权 CDP 五关价体系
+	1. 物理骨架边界对齐与防御：
+		对于短线周期（1~5日），直接提取特定周期内的真实绝对最高价（raw_high）与最低价（raw_low）作为空间边界（macro_high = raw_high, macro_low = raw_low）。
+		对于长线宏观大周期（>5日），为了防止主力天量放量后暴跌导致多空倒挂，必须强制实施边界动态拓宽：
+		macro_high = max(raw_high, final_poc + 1.5 * base_atr)
+		macro_low = min(raw_low, final_poc - 1.5 * base_atr)
+	2. 2倍重心平摊中轴线：
+		将传统 CDP 公式中的收盘价替换为通过智能裁决提炼出的多周期核心资金重心 final_poc，并赋予其核心 2 倍权重，最高价 macro_high 和最低价 macro_low 各占 1 倍权重，通过 4 份权重平摊求出加权中轴线 true_cdp。公式为：
+		true_cdp = (macro_high + macro_low + 2 * final_poc) / 4
+	3. 派生交易五关价（强注 max(0.01, ...) 熔断保护）：
+		AH (超强多头突破追涨线) = true_cdp + (macro_high - macro_low)
+		NH (正常波动多头高抛线) = 2 * true_cdp - macro_low
+		NL (正常波动空头低吸线) = max(0.01, 2 * true_cdp - macro_high)
+		AL (超强空头破位止损线) = max(0.01, true_cdp - (macro_high - macro_low))
+=========================================================================
+【第二套：手动一键即时定格监控脚本 —— 算法设计白皮书】
+一、 盘前历史波动率硬标尺锁定 (fetch_yesterday_stable_atr)
+	1. 锁定昨日闭合数据：
+		获取当前系统时钟，获取包含今天的历史日K线数据。
+		如果下载到的日K线最后一行时间戳等于今天，无条件将其切除丢弃（df_hist = df_hist.iloc[:-1]），强制将计算范围锁定在昨天之前已完全闭合的历史日K线。
+	2. 14日稳定 ATR 计算：
+		利用 pandas 的 ewm 算子计算昨收闭合的 14日 RMA 均值，输出一个绝对固定的、不随今天盘中乱跳而变形的基准历史波动率（yesterday_atr）。
+二、 当日分时自适应 ATR 直方图聚类算法 (run_intraday_single_grid_atr)
+	1. 降维扁平化绝杀：
+		实时下载今日开盘（09:30）截止到当前最新一分钟的全量 1M 分时数据。
+		利用 .to_numpy().flatten() 将 Close 与 Volume 序列无条件拍碎成一维纯 NumPy 数字链，彻底剥离 yfinance 多重列索引与多列名重复导致的 Series 维度过载漏洞。
+	2. 格子绝对宽度：
+		bin_size = yesterday_atr * atr_multiplier。设定最小变动单位 0.01 元兜底。
+	3. 当日分时动态物理边界防御：
+		提取当前一维 Close 数组中的绝对最大值 intraday_high 与绝对最小值 intraday_low。
+		以最低价减去 5倍 bin_size 为起点，以最高价加上 5倍 bin_size 为终点，按 bin_size 步长构建直方图价格格线数组 bins。
+	4. 筹码量累加运算：
+		将一维 Close 价格数组投入网格 bins 中，以对应位置的一维 Volume 数组作为累加统计权重（weights），算出今日开盘截止到此时此刻每一个价格桶内的筹码换手总量数组 counts。
+	5. 当日实时 POC 提取：
+		寻找 counts 数组中数值最大的那个格子的索引（max_idx），计算并返回中心绝对价格：(bins[max_idx] + bins[max_idx + 1]) / 2，作为此时此刻智能审定的当日分时资金重心。
+三、 当日盘中智能裁决与五关价即时生成
+	1. 网格对撞审计：
+		调用上述算法，传入 ratios 字典中对应的 0.05倍（极细）与 0.25倍（防噪）倍数，得到 p_005 与 p_020。
+		比较绝对偏离价差：如果 abs(p_005 - p_020) > 0.20 * yesterday_atr，判定盘中出现虚假异动对倒，触发瞬时熔断，最终采信防噪大网格价格（final_poc = p_020）；否则，采信极细价格（final_poc = p_005）。
+	2. 即时现价抽取：
+		取一维 Close 数组的最后一项（today_close_arr[-1]），通过 float() 强转为纯净的 Python 标量，作为当前盘中的最新变动现价（intraday_latest_price）。
+	3. 原生五关价推理：
+		提取今日分时一维数组中的最大值 macro_high 和最小值 macro_low，代入 2倍加权 CDP 递推公式，求出当前的 true_cdp。
+		AH = true_cdp + (macro_high - macro_low)
+		NH = 2 * true_cdp - macro_low
+		NL = max(0.01, 2 * true_cdp - macro_high)
+		AL = max(0.01, true_cdp - (macro_high - macro_low))
+	4. 实战备忘信号触发器（Trigger）：
+		如果 intraday_latest_price 小于等于 NL，控制台在看板下方追加打印高亮提示：触发黄金低吸建仓信号。
+		如果 intraday_latest_price 大于等于 NH，控制台在看板下方追加打印高亮提示：多头动能逼近上限，触发高抛止盈信号。
+		否则，追加打印提示：处于多空拉锯腹地，策略建议持股观望。
+=========================================================================
