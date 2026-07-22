@@ -41,6 +41,7 @@ if __name__ == "__main__":
     
         # 🤖 核心新增功能测试：在此指定你想截至的历史具体日期 (格式必须为 "YYYY-MM-DD")
         # 如果您想偶尔直接看今天最新的收盘价，请无条件将其【置为 None】(例如: CHOSEN_END_DATE = None)
+        #CHOSEN_END_DATE = None  
         CHOSEN_END_DATE = "2026-07-21"  
         
         print(f"🏁 全周期 ATR 自适应量化引擎已启动...")
@@ -62,7 +63,7 @@ if __name__ == "__main__":
             download_end_dt = target_end_dt
 
         # 2. 抓取多日大周期历史日线数据
-        print(f"📡 正在调取 {target_stock} 交易所底仓K线流数据...")
+        print(f"📡 正在调取 【{target_stock} {stock_name}】 交易所底仓K线流数据...")
         df_daily_raw = yf.download(target_stock, start=start_date_past, end=download_end_dt, interval="1d", progress=False)
         
         if df_daily_raw.empty:
