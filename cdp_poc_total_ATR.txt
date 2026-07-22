@@ -1,0 +1,368 @@
+import os
+import sys
+import datetime
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# 使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 假设 stock_dict 从配置中导入，若本地测试可自行定义
+# from CDP_poc_config import stock_dict
+
+# =========================================================================
+# 【第一步：自适应核心组件】独立方法：动态获取指定股票的历史日K线并实时计算最新的 14日 ATR
+# =========================================================================
+def fetch_dynamic_atr(ticker_symbol, period_days=14):
+    """
+    【自适应核心组件】独立方法：动态获取指定股票的历史日K线并实时计算最新的 14日 ATR
+    （已加入工业级收盘审计：15点前剔除今天残缺数据算至昨天，15点后包含今天闭合数据算至今天）
+    :param ticker_symbol: 股票代码 (例如 "688037.SS")
+    :param period_days: 计算ATR的周期，默认14天
+    :return: 计算出的最新 ATR 绝对值(float)；若获取失败则返回 None
+    """
+    try:
+        now = datetime.datetime.now()
+        end_date = now
+        start_date = end_date - datetime.timedelta(days=45)
+        
+        # 使用 yfinance 接口下载该股票的日线历史数据 (Interval 必须锁死为 "1d")
+        df_hist = yf.download(ticker_symbol, start=start_date, end=end_date, interval="1d", progress=False)
+        
+        if df_hist.empty or len(df_hist) < period_days:
+            return None
+
+        # ==========================================
+        # 🚨 【时钟自适应升级：精准锁死已闭合的最新交易日】
+        # ==========================================
+        today_str = now.strftime("%Y-%m-%d")
+        
+        # 检查下载的数据最后一行是不是今天
+        if df_hist.index[-1].strftime("%Y-%m-%d") == today_str:
+            
+            # 创建今天下午 15:00 的 A股 收盘时间对象
+            market_close_time = now.replace(hour=15, minute=0, second=0, microsecond=0)
+            
+            # 如果当前系统时间还在 15:00 之前，说明今天盘中数据未完结，必须强制剔除
+            if now < market_close_time:
+                # 强行切片，扔掉最后一行（今天），只保留到昨天已经完全收盘的闭合数据
+                df_hist = df_hist.iloc[:-1]
+
+        # 提取经过时间审计、完全闭合的历史最高价、最低价和前一日收盘价
+        high = df_hist['High'].squeeze()
+        low = df_hist['Low'].squeeze()
+        close = df_hist['Close'].squeeze()
+        
+        # 1. 计算三种物理跨度的绝对值
+        high_low = high - low
+        high_close_prev = (high - close.shift(1)).abs()
+        low_close_prev = (low - close.shift(1)).abs()
+        
+        # 2. 找出每行的最大值，即为当天的 TR (True Range)
+        tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+        
+        # 3. 对 TR 进行自适应移动平均 (RMA算法，与文华、通达信、TA-Lib 一致)
+        atr_series = tr.ewm(alpha=1/period_days, adjust=False).mean()
+        
+        # 提取最新一天的绝对值作为基准 ATR 并转为标准 float 类型
+        latest_atr = float(atr_series.iloc[-1])
+        return latest_atr
+        
+    except Exception as e:
+        print(f" 🚨 独立方法 fetch_dynamic_atr 运行异常: {e}")
+        return None
+
+# =========================================================================
+# 【底层组件 A】当日分时自适应 ATR 直方图算法
+# =========================================================================
+def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
+    """
+    【当日分时核心组件】传入特定格子 ATR 倍数系数与基准 ATR，跑单一次当日高频分时（1M/5M）的直方图筹码累加
+    （专为当日盘中实时扫描设计：历史波动率锁死格子宽度，盘中最高/最低动态拓宽捕获网）
+    :param df_today: 当日盘中实时分时 DataFrame，必须包含 ['Close', 'Volume']
+    :param atr_multiplier: ATR 的倍数系数（如极细格对应 0.05）
+    :param base_atr: 盘前计算好并固化的历史 14日基准 ATR 绝对值
+    :return: 当日该网格级提炼出的资金交火中心绝对价格 (float)
+    """
+    bin_size = base_atr * atr_multiplier
+    if bin_size < 0.01:
+        bin_size = 0.01
+
+    intraday_high = df_today["Close"].max()
+    intraday_low = df_today["Close"].min()
+    
+    # 动态构建今天分时图的价格储物桶（Bins），两端放宽 5 倍 bin_size 建立防溢出安全网
+    bins = np.arange(
+        intraday_low - bin_size * 5,
+        intraday_high + bin_size * 5,
+        bin_size,
+    )
+
+    counts, _ = np.histogram(
+        df_today["Close"], bins=bins, weights=df_today["Volume"]
+    )
+    
+    max_idx = np.argmax(counts)
+    return (bins[max_idx] + bins[max_idx + 1]) / 2
+
+# =========================================================================
+# 【底层组件 B】融合时间衰减与 ATR 自适应的多日大周期直方图算法
+# =========================================================================
+def run_single_grid_calculation(df_period, target_dates_pool, atr_multiplier, base_atr):
+    """【底层组件】传入特定的格子 ATR 倍数系数，跑单一次多天线性时间衰减直方图计算，输出对应的价格。"""
+    bin_size = base_atr * atr_multiplier  # 动态计算出当前的格子绝对厚度
+    if bin_size < 0.01:
+        bin_size = 0.01
+    
+    # 打印一下，让你在控制台能看到系统当前自动选用了多大的格子
+    print(f" └─ 动态自适应系统启动：当前基准 ATR {base_atr:.2f}元，宏观网格比例系数[{atr_multiplier}]，自动匹配筹码格子宽度(bin_size)为: {bin_size:.3f}元")
+    
+    # 建立一个覆盖这几天全局最高到最低波动范围的价格网格（Bins），外扩 5 倍防短线边缘截断误差
+    bins = np.arange(
+        df_period["Close"].min() - bin_size * 5,
+        df_period["Close"].max() + bin_size * 5,
+        bin_size,
+    )
+    combined_counts = np.zeros(len(bins) - 1)
+
+    # 遍历时间池，实施线性时间衰减累加
+    for index, date in enumerate(target_dates_pool):
+        weight = index + 1  # 越近的日期权重越高
+        df_single_day = df_period[df_period["date_str"] == date]
+
+        if df_single_day.empty:
+            continue
+
+        # 使用自适应网格进行单日直方图成交量统计
+        counts, _ = np.histogram(
+            df_single_day["Close"], bins=bins, weights=df_single_day["Volume"]
+        )
+        combined_counts += counts * weight
+
+    # 找出加权成交量总和最高的那一个格子的索引，返回其中心绝对价格
+    max_idx = np.argmax(combined_counts)
+    return (bins[max_idx] + bins[max_idx + 1]) / 2
+
+
+# =========================================================================
+# 【核心总控核心引擎】核心全周期筹码计算与五关价推理流
+# =========================================================================
+def execute_all_period_pipeline(ticker_symbol, df_all_data, target_dates_pool, df_period_days, base_price=0.0):
+    """
+    【总控引擎】支持通吃全周期（1天分时到250天年线）的筹码多维扫描与智能裁决系统
+    :param ticker_symbol: 股票代码
+    :param df_all_data: 数据表格（1天周期传入df_today分时图；多日大周期传入多日K线拼接图）
+    :param target_dates_pool: 多日计算所需的日期时间序列池（1天周期可传空list）
+    :param df_period_days: 执行扫描的周期天数（1, 3, 5, 20, 60, 120, 250）
+    :param base_price: 兜底虚拟价格（用于ATR失效时兜底计算）
+    """
+    
+    # 1. 获取当前标的历史 14日自适应基准 ATR
+    base_atr = fetch_dynamic_atr(ticker_symbol, period_days=14)
+    if base_atr is None or np.isnan(base_atr):
+        # 紧急安全兜底
+        base_atr = base_price * 0.04 if base_price > 0 else 1.00
+        print(f" ⚠️ 动态获取 ATR 失败！触发安全熔断：自动采用虚拟 ATR ({base_atr:.3f}元) 兜底")
+
+    # =========================================================================
+    # 第三步：建立 A股 专属的 ATR 倍数矩阵（全周期多维扫描自适应分配树）
+    # 键名保持 p_005 等原样，确保下游代码无缝对接。
+    # =========================================================================
+    if df_period_days == 1:
+        ratios = {
+            "p_005": 0.05,    # 0.05倍 ATR (中长精密) -> 捕捉日内极敏锐的多空换手区
+            "p_010": 0.125,   # 0.125倍 ATR (战略标准) -> 标准的日内筹码骨架 ***量化私募推荐优化配置
+            "p_0020": 0.25,   # 0.25倍 ATR (波段防噪) -> 四分之一日内波幅，强力过滤毛刺
+            "p_0050": 0.60,   # 0.60倍 ATR (牛熊趋势) -> 大半个日内空间，锚定日线级大本营
+        }
+    elif df_period_days == 3:
+        ratios = {"p_005": 0.10, "p_010": 0.20, "p_0020": 0.40, "p_0050": 1.00}
+    elif df_period_days == 5:
+        ratios = {"p_005": 0.15, "p_010": 0.30, "p_0020": 0.60, "p_0050": 1.50}
+    elif df_period_days == 20:
+        ratios = {"p_005": 0.25, "p_010": 0.50, "p_0020": 1.00, "p_0050": 2.00}
+    elif df_period_days == 60:
+        ratios = {"p_005": 0.50, "p_010": 1.00, "p_0020": 1.50, "p_0050": 3.00}
+    elif df_period_days == 120:
+        ratios = {"p_005": 0.80, "p_010": 1.50, "p_0020": 2.50, "p_0050": 5.00}
+    else:  # 250日线以上
+        ratios = {"p_005": 1.00, "p_010": 2.00, "p_0020": 4.00, "p_0050": 8.00}
+
+    # 执行并发矩阵堆积计算
+    poc_matrix = {}
+    for key, atr_multiplier in ratios.items():
+        if df_period_days == 1:
+            # 1天短线盘中分时，直接调用当日分时自适应组件
+            poc_matrix[key] = run_intraday_single_grid_atr(df_all_data, atr_multiplier, base_atr)
+        else:
+            # 多日宏观大周期，调用带线性时间衰减的组件
+            poc_matrix[key] = run_single_grid_calculation(df_all_data, target_dates_pool, atr_multiplier, base_atr)
+
+    # =========================================================================
+    # 第四步：🤖 智能裁决系统（提取4格结果并做出智能合并决策）
+    # =========================================================================
+    p_005 = poc_matrix["p_005"]
+    p_020 = poc_matrix["p_0020"]
+
+    # 🤖 动态偏离度熔断卡值阈值分级树
+    if df_period_days <= 5:
+        audit_threshold = 0.20 * base_atr  # 短线级：严格锁死 20% ATR 价差
+    elif df_period_days <= 20:
+        audit_threshold = 0.40 * base_atr  # 月度级：放宽至 40% ATR 价差
+    else:
+        audit_threshold = 0.80 * base_atr  # 季度及年度宏观级：允许 80% ATR 的战略拉锯偏离
+
+    # 实施真正基于波动率门限的欺骗拦截审计
+    if abs(p_005 - p_020) > audit_threshold:
+        final_poc = p_020  # 自动熔断欺骗，强制采信鲁棒性更高的防噪网格
+        audit_status = f"🚨 拦截异常！【{df_period_days}日线】极细格失真({p_005:.2f}元)，系统强制采信防噪网格({p_020:.2f}元)"
+    else:
+        final_poc = p_005  # 数据共振吻合，采信高精度极细价格
+        audit_status = f"🟢 【{df_period_days}日线】筹码分布健康，多网格共振吻合"
+
+    # ==========================================
+    # 第五步：运行宏观 2倍POC加权 CDP 五关价公式体系 (工业级防倒挂与防致盲终极合体版本)
+    # ==========================================
+    raw_high = df_all_data["High"].max()
+    raw_low = df_all_data["Low"].min() 
+
+    # 🚨 【动态物理边界防御保护】为了防止宏观跳空或高位大暴动导致多空倒挂，实施物理宽幅支撑墙
+    if df_period_days > 5:
+        macro_high = max(raw_high, final_poc + 1.5 * base_atr)
+        macro_low = min(raw_low, final_poc - 1.5 * base_atr)
+    else:
+        # 1/3/5日短线纯闭合周期，第四步审计已绝对纯净，直接回归最原生的绝对物理骨架交互
+        macro_high = raw_high
+        macro_low = raw_low
+
+    # 1. 计算核心加权中轴线 (CDP)
+    # 我们将传统收盘价换成全天/全周期多空核心交火重心 final_poc，赋予其2倍权重，总计4份权重进行平摊
+    true_cdp = (macro_high + macro_low + 2 * final_poc) / 4
+
+    # 2. 派生交易五关价，并强行加入 max(0.01, ...) 兜底熔断保护，防止负数无法挂单
+    ah_poc = true_cdp + (macro_high - macro_low)                  # 超强多头边界：突破可追多
+    nh_poc = 2 * true_cdp - macro_low                             # 正常波动高点：适合日内高抛
+    nl_poc = max(0.01, 2 * true_cdp - macro_high)                 # 正常波动低点：适合日内低吸
+    al_poc = max(0.01, true_cdp - (macro_high - macro_low))       # 超强空头边界：破位需止损
+
+    # 将算好的五关价参数字典打包返回给上层看板
+    return {
+        "final_poc": final_poc,
+        "true_cdp": true_cdp,
+        "al_poc": al_poc,
+        "nl_poc": nl_poc,
+        "nh_poc": nh_poc,
+        "ah_poc": ah_poc,
+        "audit_status": audit_status
+    }
+    
+# =========================================================================
+# 【第六步：实战演练总入口】合并测试入口，使用 yfinance 抓取真实 A 股历史数据
+# =========================================================================
+if __name__ == "__main__":
+    # 以测试标的：芯源微（688037.SS）为例进行全闭环压力测试
+    target_stock = "688037.SS"
+    print(f"🏁 开始激活全周期 ATR 自适应量化引擎...")
+    print(f"📡 正在通过 yfinance 调取 {target_stock} 交易所实时历史数据...")
+
+    # ---------------------------------------------------------------------
+    # 1. 抓取真实的多日大周期日线数据（用于 3、5、20、60、120、250 日宏观筹码堆积）
+    # ---------------------------------------------------------------------
+    end_date_now = datetime.datetime.now()
+    # 往前狠抓400天数据，确保满足250天交易所开盘日K线的完备性
+    start_date_past = end_date_now - datetime.timedelta(days=400)
+    
+    df_daily_raw = yf.download(target_stock, start=start_date_past, end=end_date_now, interval="1d", progress=False)
+    
+    if df_daily_raw.empty:
+        print(f"🚨 错误：未能获取到历史日K线数据，请检查网络或更换标的代码！")
+        sys.exit(0)
+    
+    # 🚨 【多重索引强力解包保护】
+    # 如果 yfinance 返回了包含股票代码的多重列索引 (Multi-Index)，强制将其扁平化，只保留纯列名
+    if isinstance(df_daily_raw.columns, pd.MultiIndex):
+        df_daily_raw.columns = df_daily_raw.columns.get_level_values(0)
+    
+    # 格式化日期，生成算法循环所需的时间衰减池 date_str 列
+    df_daily_raw['date_str'] = df_daily_raw.index.strftime("%Y-%m-%d")
+
+    # ---------------------------------------------------------------------
+    # 2. 抓取真实的当日分时数据（用于 1天短线高频分时扫描）
+    # yfinance 最多支持下载近 7 天内的 1 分钟级高频分时数据
+    # ---------------------------------------------------------------------
+    df_intraday_raw = yf.download(target_stock, period="1d", interval="1m", progress=False)
+    
+    # 🚨 【多重索引强力解包保护】同步处理分时图表格
+    if isinstance(df_intraday_raw.columns, pd.MultiIndex):
+        df_intraday_raw.columns = df_intraday_raw.columns.get_level_values(0)
+    
+    # =========================================================================
+    # 🚨 【终极强推标量抽取：彻底解决 Series/ravel 维度过载报错】
+    # =========================================================================
+    # 核心原理：不再直接对 ['Close'] 列使用任何方法。我们直接锁定最后一行 iloc[-1]，
+    # 然后把它当成最基础的 Python 字典/映射结构。不管这一列外面套了多少层 Pandas 列壳，
+    # 只要用 ['Close'] 抽取，再用 .flatten() 或直接单标量转 float，就能把真金白银的价格毫无损耗地扒出来。
+    last_row_array = np.array(df_daily_raw['Close'].iloc[-1]).flatten()
+    fallback_base_price = float(last_row_array[0])
+
+    if df_intraday_raw.empty:
+        print(f"🚨 警告：未能直接获取到当日实时 1M 分时图，系统将自动切片日线最后一日数据充当虚拟 1M 流量测试环境")
+        # 如果当日未开盘或网络故障，自动复制最后一根日K数据 240 次，模拟 1 天 4 小时的高频分时图，防止引擎死锁
+        last_close_val = fallback_base_price
+        minutes_sim = 240
+        sim_closes = last_close_val + np.cumsum(np.random.normal(0, 0.5, minutes_sim))
+        # 故意制造几笔恶意的瞬时砸盘脉冲噪声单，压力测试当日分时 ATR 算法的第四步拦截熔断功能
+        sim_closes[100:105] = last_close_val * 0.85
+        df_intraday_raw = pd.DataFrame({
+            "Close": sim_closes,
+            "High": sim_closes + 0.2,
+            "Low": sim_closes - 0.2,
+            "Volume": np.random.randint(1000, 5000, minutes_sim)
+        })
+
+    # ---------------------------------------------------------------------
+    # 3. 驱动多周期并发扫描核心循环
+    # ---------------------------------------------------------------------
+    periods_pool = [1, 3, 5, 20, 60, 120, 250]
+    results_board = {}
+    
+    for days in periods_pool:
+        if days == 1:
+            # 1天短线单日分时：直接传入真实分时图 DataFrame，日期池传空
+            results_board[days] = execute_all_period_pipeline(
+                target_stock, df_intraday_raw, [], df_period_days=1, base_price=fallback_base_price
+            )
+        else:
+            # 多日宏观大周期：截取对应天数的日K线切片传入
+            df_slice = df_daily_raw.iloc[-days:]
+            # 提取这几天的真实历史具体日期作为衰减循环池
+            sub_dates_pool = df_slice["date_str"].tolist()
+            results_board[days] = execute_all_period_pipeline(
+                target_stock, df_slice, sub_dates_pool, df_period_days=days, base_price=fallback_base_price
+            )
+
+    # ---------------------------------------------------------------------
+    # 4. 工业级多周期对齐终判看板优雅打印
+    # ---------------------------------------------------------------------
+    print("\n" + "🛡️"*12 + " 全周期量化终判对齐审计复盘 " + "🛡️"*12)
+    for days in periods_pool:
+        print(f"【{days}天线周期审计日志】: {results_board[days]['audit_status']}")
+        
+    print("\n%s 【%s】全周期量化终判对齐战略总看板 %s" % ("🏁" * 15, datetime.datetime.now().strftime('%Y-%m-%d'), "🏁" * 15))
+    header = f"{'周期类型':<14} | {'智能审定真POC':<12} | {'中轴(CDP)':<10} | {'止损边界(AL)':<10} | {'低吸支撑(NL)':<10} | {'高抛阻力(NH)':<10} | {'追多边界(AH)':<10}"
+    print("-" * 115)
+    print(header)
+    print("-" * 115)
+    
+    for days in periods_pool:
+        res = results_board[days]
+        # 根据周期天数优雅对齐转换成可读的中文看板头
+        if days <= 5:
+            name_str = f"{days}天短线历史"
+        else:
+            name_str = f"20日线(月度)" if days==20 else (f"60日线(季度)" if days==60 else (f"120日线(半年)" if days==120 else f"250日线(年度)"))
+            
+        print(f"{name_str:<16} | {res['final_poc']:<16.2f} | {res['true_cdp']:<12.2f} | {res['al_poc']:<14.2f} | {res['nl_poc']:<14.2f} | {res['nh_poc']:<14.2f} | {res['ah_poc']:<12.2f}")
+    print("=" * 115)
+
+
