@@ -8,7 +8,7 @@ import yfinance as yf
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 假设 stock_dict 从配置中导入，若本地测试可自行定义
-# from CDP_poc_config import stock_dict
+from CDP_poc_config import stock_dict
 
 # =========================================================================
 # 【第一步：自适应核心组件】独立方法：动态获取指定股票的历史日K线并实时计算最新的 14日 ATR
@@ -115,7 +115,7 @@ def run_single_grid_calculation(df_period, target_dates_pool, atr_multiplier, ba
         bin_size = 0.01
     
     # 打印一下，让你在控制台能看到系统当前自动选用了多大的格子
-    print(f" └─ 动态自适应系统启动：当前基准 ATR {base_atr:.2f}元，宏观网格比例系数[{atr_multiplier}]，自动匹配筹码格子宽度(bin_size)为: {bin_size:.3f}元")
+    #print(f" └─ 动态自适应系统启动：当前基准 ATR {base_atr:.2f}元，宏观网格比例系数[{atr_multiplier}]，自动匹配筹码格子宽度(bin_size)为: {bin_size:.3f}元")
     
     # 建立一个覆盖这几天全局最高到最低波动范围的价格网格（Bins），外扩 5 倍防短线边缘截断误差
     bins = np.arange(
@@ -261,108 +261,128 @@ def execute_all_period_pipeline(ticker_symbol, df_all_data, target_dates_pool, d
 # =========================================================================
 if __name__ == "__main__":
     # 以测试标的：芯源微（688037.SS）为例进行全闭环压力测试
-    target_stock = "688037.SS"
-    print(f"🏁 开始激活全周期 ATR 自适应量化引擎...")
-    print(f"📡 正在通过 yfinance 调取 {target_stock} 交易所实时历史数据...")
-
-    # ---------------------------------------------------------------------
-    # 1. 抓取真实的多日大周期日线数据（用于 3、5、20、60、120、250 日宏观筹码堆积）
-    # ---------------------------------------------------------------------
-    end_date_now = datetime.datetime.now()
-    # 往前狠抓400天数据，确保满足250天交易所开盘日K线的完备性
-    start_date_past = end_date_now - datetime.timedelta(days=400)
-    
-    df_daily_raw = yf.download(target_stock, start=start_date_past, end=end_date_now, interval="1d", progress=False)
-    
-    if df_daily_raw.empty:
-        print(f"🚨 错误：未能获取到历史日K线数据，请检查网络或更换标的代码！")
-        sys.exit(0)
-    
-    # 🚨 【多重索引强力解包保护】
-    # 如果 yfinance 返回了包含股票代码的多重列索引 (Multi-Index)，强制将其扁平化，只保留纯列名
-    if isinstance(df_daily_raw.columns, pd.MultiIndex):
-        df_daily_raw.columns = df_daily_raw.columns.get_level_values(0)
-    
-    # 格式化日期，生成算法循环所需的时间衰减池 date_str 列
-    df_daily_raw['date_str'] = df_daily_raw.index.strftime("%Y-%m-%d")
-
-    # ---------------------------------------------------------------------
-    # 2. 抓取真实的当日分时数据（用于 1天短线高频分时扫描）
-    # yfinance 最多支持下载近 7 天内的 1 分钟级高频分时数据
-    # ---------------------------------------------------------------------
-    df_intraday_raw = yf.download(target_stock, period="1d", interval="1m", progress=False)
-    
-    # 🚨 【多重索引强力解包保护】同步处理分时图表格
-    if isinstance(df_intraday_raw.columns, pd.MultiIndex):
-        df_intraday_raw.columns = df_intraday_raw.columns.get_level_values(0)
-    
-    # =========================================================================
-    # 🚨 【终极强推标量抽取：彻底解决 Series/ravel 维度过载报错】
-    # =========================================================================
-    # 核心原理：不再直接对 ['Close'] 列使用任何方法。我们直接锁定最后一行 iloc[-1]，
-    # 然后把它当成最基础的 Python 字典/映射结构。不管这一列外面套了多少层 Pandas 列壳，
-    # 只要用 ['Close'] 抽取，再用 .flatten() 或直接单标量转 float，就能把真金白银的价格毫无损耗地扒出来。
-    last_row_array = np.array(df_daily_raw['Close'].iloc[-1]).flatten()
-    fallback_base_price = float(last_row_array[0])
-
-    if df_intraday_raw.empty:
-        print(f"🚨 警告：未能直接获取到当日实时 1M 分时图，系统将自动切片日线最后一日数据充当虚拟 1M 流量测试环境")
-        # 如果当日未开盘或网络故障，自动复制最后一根日K数据 240 次，模拟 1 天 4 小时的高频分时图，防止引擎死锁
-        last_close_val = fallback_base_price
-        minutes_sim = 240
-        sim_closes = last_close_val + np.cumsum(np.random.normal(0, 0.5, minutes_sim))
-        # 故意制造几笔恶意的瞬时砸盘脉冲噪声单，压力测试当日分时 ATR 算法的第四步拦截熔断功能
-        sim_closes[100:105] = last_close_val * 0.85
-        df_intraday_raw = pd.DataFrame({
-            "Close": sim_closes,
-            "High": sim_closes + 0.2,
-            "Low": sim_closes - 0.2,
-            "Volume": np.random.randint(1000, 5000, minutes_sim)
-        })
-
-    # ---------------------------------------------------------------------
-    # 3. 驱动多周期并发扫描核心循环
-    # ---------------------------------------------------------------------
-    periods_pool = [1, 3, 5, 20, 60, 120, 250]
-    results_board = {}
-    
-    for days in periods_pool:
-        if days == 1:
-            # 1天短线单日分时：直接传入真实分时图 DataFrame，日期池传空
-            results_board[days] = execute_all_period_pipeline(
-                target_stock, df_intraday_raw, [], df_period_days=1, base_price=fallback_base_price
-            )
-        else:
-            # 多日宏观大周期：截取对应天数的日K线切片传入
-            df_slice = df_daily_raw.iloc[-days:]
-            # 提取这几天的真实历史具体日期作为衰减循环池
-            sub_dates_pool = df_slice["date_str"].tolist()
-            results_board[days] = execute_all_period_pipeline(
-                target_stock, df_slice, sub_dates_pool, df_period_days=days, base_price=fallback_base_price
-            )
-
-    # ---------------------------------------------------------------------
-    # 4. 工业级多周期对齐终判看板优雅打印
-    # ---------------------------------------------------------------------
-    print("\n" + "🛡️"*12 + " 全周期量化终判对齐审计复盘 " + "🛡️"*12)
-    for days in periods_pool:
-        print(f"【{days}天线周期审计日志】: {results_board[days]['audit_status']}")
+    #target_stock = "688037.SS"
+    stock_codes = list(stock_dict.keys())
+    for stock_code in stock_codes:
+        # 转换为字符串，防止原数据是数字类型
+        stock_code = str(stock_code)
         
-    print("\n%s 【%s】全周期量化终判对齐战略总看板 %s" % ("🏁" * 15, datetime.datetime.now().strftime('%Y-%m-%d'), "🏁" * 15))
-    header = f"{'周期类型':<14} | {'智能审定真POC':<12} | {'中轴(CDP)':<10} | {'止损边界(AL)':<10} | {'低吸支撑(NL)':<10} | {'高抛阻力(NH)':<10} | {'追多边界(AH)':<10}"
-    print("-" * 115)
-    print(header)
-    print("-" * 115)
-    
-    for days in periods_pool:
-        res = results_board[days]
-        # 根据周期天数优雅对齐转换成可读的中文看板头
-        if days <= 5:
-            name_str = f"{days}天短线历史"
+        # 判断是否已经带了后缀，如果没有，则根据规则拼接
+        if not (stock_code.endswith('.SS') or stock_code.endswith('.SZ')):
+            # 科创板(688..)和沪市主板(60..)拼接 .SS，其余（如创业板300..）拼接 .SZ
+            if stock_code.startswith(('688', '60')):
+                target_stock = f"{stock_code}.SS"
+            else:
+                target_stock = f"{stock_code}.SZ"
         else:
-            name_str = f"20日线(月度)" if days==20 else (f"60日线(季度)" if days==60 else (f"120日线(半年)" if days==120 else f"250日线(年度)"))
+            target_stock = stock_code
+
+        stock_name = stock_dict.get(
+            stock_code,
+            "未知股票"
+        )  
+        
+        print(f"🏁 开始激活全周期 ATR 自适应量化引擎...")
+        print(f"📡 正在通过 yfinance 调取 {target_stock} {stock_name} 交易所实时历史数据...")
+
+        # ---------------------------------------------------------------------
+        # 1. 抓取真实的多日大周期日线数据（用于 3、5、20、60、120、250 日宏观筹码堆积）
+        # ---------------------------------------------------------------------
+        end_date_now = datetime.datetime.now()
+        # 往前狠抓400天数据，确保满足250天交易所开盘日K线的完备性
+        start_date_past = end_date_now - datetime.timedelta(days=400)
+        
+        df_daily_raw = yf.download(target_stock, start=start_date_past, end=end_date_now, interval="1d", progress=False)
+        
+        if df_daily_raw.empty:
+            print(f"🚨 错误：未能获取到历史日K线数据，请检查网络或更换标的代码！")
+            sys.exit(0)
+        
+        # 🚨 【多重索引强力解包保护】
+        # 如果 yfinance 返回了包含股票代码的多重列索引 (Multi-Index)，强制将其扁平化，只保留纯列名
+        if isinstance(df_daily_raw.columns, pd.MultiIndex):
+            df_daily_raw.columns = df_daily_raw.columns.get_level_values(0)
+        
+        # 格式化日期，生成算法循环所需的时间衰减池 date_str 列
+        df_daily_raw['date_str'] = df_daily_raw.index.strftime("%Y-%m-%d")
+
+        # ---------------------------------------------------------------------
+        # 2. 抓取真实的当日分时数据（用于 1天短线高频分时扫描）
+        # yfinance 最多支持下载近 7 天内的 1 分钟级高频分时数据
+        # ---------------------------------------------------------------------
+        df_intraday_raw = yf.download(target_stock, period="1d", interval="1m", progress=False)
+        
+        # 🚨 【多重索引强力解包保护】同步处理分时图表格
+        if isinstance(df_intraday_raw.columns, pd.MultiIndex):
+            df_intraday_raw.columns = df_intraday_raw.columns.get_level_values(0)
+        
+        # =========================================================================
+        # 🚨 【终极强推标量抽取：彻底解决 Series/ravel 维度过载报错】
+        # =========================================================================
+        # 核心原理：不再直接对 ['Close'] 列使用任何方法。我们直接锁定最后一行 iloc[-1]，
+        # 然后把它当成最基础的 Python 字典/映射结构。不管这一列外面套了多少层 Pandas 列壳，
+        # 只要用 ['Close'] 抽取，再用 .flatten() 或直接单标量转 float，就能把真金白银的价格毫无损耗地扒出来。
+        last_row_array = np.array(df_daily_raw['Close'].iloc[-1]).flatten()
+        fallback_base_price = float(last_row_array[0])
+
+        if df_intraday_raw.empty:
+            print(f"🚨 警告：未能直接获取到当日实时 1M 分时图，系统将自动切片日线最后一日数据充当虚拟 1M 流量测试环境")
+            # 如果当日未开盘或网络故障，自动复制最后一根日K数据 240 次，模拟 1 天 4 小时的高频分时图，防止引擎死锁
+            last_close_val = fallback_base_price
+            minutes_sim = 240
+            sim_closes = last_close_val + np.cumsum(np.random.normal(0, 0.5, minutes_sim))
+            # 故意制造几笔恶意的瞬时砸盘脉冲噪声单，压力测试当日分时 ATR 算法的第四步拦截熔断功能
+            sim_closes[100:105] = last_close_val * 0.85
+            df_intraday_raw = pd.DataFrame({
+                "Close": sim_closes,
+                "High": sim_closes + 0.2,
+                "Low": sim_closes - 0.2,
+                "Volume": np.random.randint(1000, 5000, minutes_sim)
+            })
+
+        # ---------------------------------------------------------------------
+        # 3. 驱动多周期并发扫描核心循环
+        # ---------------------------------------------------------------------
+        periods_pool = [1, 3, 5, 20, 60, 120, 250]
+        results_board = {}
+        
+        for days in periods_pool:
+            if days == 1:
+                # 1天短线单日分时：直接传入真实分时图 DataFrame，日期池传空
+                results_board[days] = execute_all_period_pipeline(
+                    target_stock, df_intraday_raw, [], df_period_days=1, base_price=fallback_base_price
+                )
+            else:
+                # 多日宏观大周期：截取对应天数的日K线切片传入
+                df_slice = df_daily_raw.iloc[-days:]
+                # 提取这几天的真实历史具体日期作为衰减循环池
+                sub_dates_pool = df_slice["date_str"].tolist()
+                results_board[days] = execute_all_period_pipeline(
+                    target_stock, df_slice, sub_dates_pool, df_period_days=days, base_price=fallback_base_price
+                )
+
+        # ---------------------------------------------------------------------
+        # 4. 工业级多周期对齐终判看板优雅打印
+        # ---------------------------------------------------------------------
+        print("\n" + "🛡️"*12 + " 全周期量化终判对齐审计复盘 " + "🛡️"*12)
+        for days in periods_pool:
+            print(f"【{days}天线周期审计日志】: {results_board[days]['audit_status']}")
             
-        print(f"{name_str:<16} | {res['final_poc']:<16.2f} | {res['true_cdp']:<12.2f} | {res['al_poc']:<14.2f} | {res['nl_poc']:<14.2f} | {res['nh_poc']:<14.2f} | {res['ah_poc']:<12.2f}")
-    print("=" * 115)
+        print("\n%s 【%s】全周期量化终判对齐战略总看板 %s" % ("🏁" * 15, datetime.datetime.now().strftime('%Y-%m-%d'), "🏁" * 15))
+        header = f"{'周期类型':<14} | {'智能审定真POC':<12} | {'中轴(CDP)':<10} | {'止损边界(AL)':<10} | {'低吸支撑(NL)':<10} | {'高抛阻力(NH)':<10} | {'追多边界(AH)':<10}"
+        print("-" * 115)
+        print(header)
+        print("-" * 115)
+        
+        for days in periods_pool:
+            res = results_board[days]
+            # 根据周期天数优雅对齐转换成可读的中文看板头
+            if days <= 5:
+                name_str = f"{days}天短线历史"
+            else:
+                name_str = f"20日线(月度)" if days==20 else (f"60日线(季度)" if days==60 else (f"120日线(半年)" if days==120 else f"250日线(年度)"))
+                
+            print(f"{name_str:<16} | {res['final_poc']:<16.2f} | {res['true_cdp']:<12.2f} | {res['al_poc']:<14.2f} | {res['nl_poc']:<14.2f} | {res['nh_poc']:<14.2f} | {res['ah_poc']:<12.2f}")
+        print("=" * 115)
 
 
