@@ -1,0 +1,187 @@
+import os
+import sys
+import datetime
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# 使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+# =========================================================================
+# 【自适应核心组件】独立方法：动态获取历史日K线并计算最新的 14日 ATR（强制锁死至昨收）
+# =========================================================================
+def fetch_yesterday_stable_atr(ticker_symbol, period_days=14):
+    """
+    【盘前锁定组件】独立方法：动态获取历史日线并计算截至昨天的稳定 14日 ATR
+    （强制切除今天未完结的K线，确保今天一整天盘中格子的物理厚度稳如磐石，绝不乱变形）
+    """
+    try:
+        now = datetime.datetime.now()
+        end_date = now
+        start_date = end_date - datetime.timedelta(days=60)
+        
+        df_hist = yf.download(ticker_symbol, start=start_date, end=end_date, interval="1d", progress=False)
+        if df_hist.empty or len(df_hist) < period_days:
+            return None
+        
+        # 强制将其多重列索引扁平化，只保留纯列名
+        if isinstance(df_hist.columns, pd.MultiIndex):
+            df_hist.columns = df_hist.columns.get_level_values(0)
+
+        # 🚨 【强制锁死昨日边界】如果下载到了今天的K线，无条件将其切掉，必须算到昨天的闭合K线
+        today_str = now.strftime("%Y-%m-%d")
+        if df_hist.index[-1].strftime("%Y-%m-%d") == today_str:
+            df_hist = df_hist.iloc[:-1]
+
+        # 🚨 【多重列安全降维保护】利用 to_numpy().flatten() 确保即使列名重复也绝不变成二维 Series
+        high = df_hist['High'].to_numpy().flatten()
+        low = df_hist['Low'].to_numpy().flatten()
+        close = df_hist['Close'].to_numpy().flatten()
+        
+        high_low = high - low
+        high_close_prev = np.abs(high[1:] - close[:-1])
+        low_close_prev = np.abs(low[1:] - close[:-1])
+        
+        # 对齐第一天切片，计算 TR
+        high_low_trimmed = high_low[1:]
+        tr_np = np.maximum(high_low_trimmed, np.maximum(high_close_prev, low_close_prev))
+        
+        # 转回 pandas 计算 RMA 移动平均
+        tr_series = pd.Series(tr_np)
+        atr_series = tr_series.ewm(alpha=1/period_days, adjust=False).mean()
+        return float(atr_series.iloc[-1])
+    except Exception as e:
+        print(f" 🚨 fetch_yesterday_stable_atr 运行异常: {e}")
+        return None
+
+
+# =========================================================================
+# 【当日分时底层组件】当日分时自适应 ATR 直方图算法（引入 5倍 动态物理防溢出安全网）
+# =========================================================================
+def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
+    """
+    【当日分时核心组件】传入特定格子 ATR 倍数系数与基准 ATR，跑单一次当日高频分时（1M/5M）的直方图筹码累加
+    """
+    bin_size = base_atr * atr_multiplier
+    if bin_size < 0.01:
+        bin_size = 0.01
+
+    # 🚨 【多列降维绝杀】强行转换为 NumPy 一维纯数组，完美兼容 yfinance 多列残留问题
+    close_array = df_today["Close"].to_numpy().flatten()
+    intraday_high = close_array.max()
+    intraday_low = close_array.min()
+    
+    # 动态构建今天分时图的价格储物桶（Bins）
+    bins = np.arange(
+        intraday_low - bin_size * 5,
+        intraday_high + bin_size * 5,
+        bin_size,
+    )
+
+    # 提取多列可能重复时，无条件把 Volume 也拍平，取其对应位置相加
+    volume_array = df_today["Volume"].to_numpy().flatten()
+    
+    # 为了防止一维对齐时因为重复列导致长度成倍过载，将 close 长度与 volume 长度强制对齐
+    if len(close_array) != len(volume_array):
+        # 兜底截断，保证直方图计算正常
+        min_len = min(len(close_array), len(volume_array))
+        close_array = close_array[:min_len]
+        volume_array = volume_array[:min_len]
+
+    counts, _ = np.histogram(
+        close_array, bins=bins, weights=volume_array
+    )
+    
+    max_idx = np.argmax(counts)
+    return (bins[max_idx] + bins[max_idx + 1]) / 2
+
+
+# =========================================================================
+# 【手动一键执行总控入口】
+# =========================================================================
+if __name__ == "__main__":
+    target_stock = "688037.SS"  # 以芯源微为例
+    print(f"🏁 激活盘中自适应量化扫描，当前监控标的: {target_stock}")
+    
+    # 1. ⚙️ 计算昨收闭合的 14日历史波动率作为今日网格硬标尺
+    yesterday_atr = fetch_yesterday_stable_atr(target_stock, period_days=14)
+    if yesterday_atr is None or np.isnan(yesterday_atr):
+        yesterday_atr = 340.0 * 0.04  # 假设的虚拟兜底
+        print(f" ⚠️ 盘前未抓到稳定ATR，触发安全熔断：自动采用虚拟 ATR ({yesterday_atr:.2f}元) 锁定今日标尺")
+    else:
+        print(f" 🟢 历史波动率标尺锁定成功！今日自适应网格基准 ATR 为: {yesterday_atr:.3f}元")
+
+    # 2. 📡 实时抓取【今天开盘以来截止到此时此刻】最新的 1分钟级 实时分时图数据
+    print(f"📡 正在下载今日开盘至今的最新分时流数据...")
+    df_today = yf.download(target_stock, period="1d", interval="1m", progress=False)
+    
+    if isinstance(df_today.columns, pd.MultiIndex):
+        df_today.columns = df_today.columns.get_level_values(0)
+        
+    if df_today.empty:
+        print(f"🚨 错误：未能在盘中抓取到有效的实时分时Tick数据，请检查网络或确认当前是否处于A股交易时段！")
+        sys.exit(0)
+
+    # 3. 建立 A股 专属的单日分时 4 大 ATR 矩阵
+    intraday_ratios = {
+        "p_005": 0.05,    # 0.05倍 ATR (中长精密) -> 捕捉日内极敏锐的多空换手区
+        "p_010": 0.125,   # 0.125倍 ATR (战略标准) -> 标准的日内筹码骨架 ***量化私募推荐优化配置
+        "p_0020": 0.25,   # 0.25倍 ATR (波段防噪) -> 四分之一日内波幅，强力过滤毛刺
+        "p_0050": 0.60,   # 0.60倍 ATR (牛熊趋势) -> 大半个日内空间，锚定日线级大本营
+    }
+
+    # 并发矩阵堆积筹码计算
+    poc_matrix = {}
+    for key, atr_multiplier in intraday_ratios.items():
+        poc_matrix[key] = run_intraday_single_grid_atr(df_today, atr_multiplier, yesterday_atr)
+
+    # 4. 🤖 智能裁决系统（当日盘中防噪声骗线审计）
+    p_005 = poc_matrix["p_005"]
+    p_020 = poc_matrix["p_0020"]
+    audit_threshold = 0.20 * yesterday_atr  # 当日分时：严防死守，锁死 20% ATR 的最大容忍偏离度
+
+    if abs(p_005 - p_020) > audit_threshold:
+        final_poc = p_020  # 自动触发盘中熔断，强制采信粗网格合并后的真实主战场
+        audit_status = f"🚨 盘中拦截异常脉冲！细格子失真({p_005:.2f}元)，系统强制启动防噪网格"
+    else:
+        final_poc = p_005  # 如果价差很小，说明盘中多空交火很干净，使用最精准的细网格
+        audit_status = "🟢 盘中筹码吻合共振，多空真实交火，采信高精度极细网格"
+
+    # 5. 运行宏观 2倍POC加权 CDP 五关价公式体系 (纯净日内分时原生交互版)
+    # 🚨 【绝杀降维改写】利用 to_numpy().flatten() 无条件将其还原为干净的一维数字链
+    today_high_arr = df_today["High"].to_numpy().flatten()
+    today_low_arr = df_today["Low"].to_numpy().flatten()
+    today_close_arr = df_today["Close"].to_numpy().flatten()
+
+    macro_high = today_high_arr.max()
+    macro_low = today_low_arr.min() 
+    
+    # 提取盘中最靠近现在的一分钟收盘价，作为盘中实时变动的“最新现价”
+    intraday_latest_price = float(today_close_arr[-1])
+
+    true_cdp = (macro_high + macro_low + 2 * final_poc) / 4
+    ah_poc = true_cdp + (macro_high - macro_low)
+    nh_poc = 2 * true_cdp - macro_low
+    nl_poc = max(0.01, 2 * true_cdp - macro_high)
+    al_poc = max(0.01, true_cdp - (macro_high - macro_low))
+
+    # 6. 优雅打印定格监控看板
+    print(f"\n" + "⚡"*8 + f" 盘中即时定格看板 | 刷新时钟: {datetime.datetime.now().strftime('%H:%M:%S')} " + "⚡"*8)
+    print(f" 监控标的: {target_stock} | 此时盘中最新现价: {intraday_latest_price:.2f}元")
+    print(f" 审计状态: {audit_status}")
+    print(f" 🎯 智能审定的当前真实分时 POC (资金重心): {final_poc:.2f}元")
+    print(f"---------------------------------------------------------------------------")
+    print(f" [追多突破线 AH]: {ah_poc:.2f}元 | [日内高抛压力 NH]: {nh_poc:.2f}元")
+    print(f" [分时中轴线 CDP]: {true_cdp:.2f}元")
+    print(f" [日内低吸支撑 NL]: {nl_poc:.2f}元 | [做空破位止损 AL]: {al_poc:.2f}元")
+    print(f"===========================================================================\n")
+    
+    # 🤖 信号动态快显
+    if intraday_latest_price <= nl_poc:
+        print(f"    💡 【实战备忘】: 现价已跌破 NL 线，正处于黄金低吸区，可执行左侧建仓。")
+    elif intraday_latest_price >= nh_poc:
+        print(f"    💡 【实战备忘】: 现价已突破 NH 线，多头动能逼近上限，可执行高抛锁定利润。")
+    else:
+        print(f"    💡 【实战备忘】: 当前处于多空拉锯腹地，策略建议：持股观望，静待回踩或突破。")
