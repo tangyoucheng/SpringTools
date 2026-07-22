@@ -1,0 +1,107 @@
+import pandas as pd
+from openpyxl import load_workbook
+
+
+def export_cdp_to_excel(
+    periods_pool,
+    results_board,
+    target_stock,  # 股票代码
+    stock_name,  # 股票名称
+    stock_metrics_close_p,  # 当前最新价/收盘价
+    stock_metrics_high_p,  # 最高价
+    stock_metrics_low_p,  # 最低价
+    end_date,
+    template_path="CDP_poc_stock_temple.xlsm",
+):
+    """将股票基本数据与CDP/POC数据无缝写入Excel模板，并在A1输出end_date"""
+
+    # 1. 定义统一的 CDP 数据表头
+    headers = [
+        "周期类型",
+        "智能审定真POC",
+        "中轴(CDP)",
+        "止损边界(AL)",
+        "低吸支撑(NL)",
+        "高抛阻力(NH)",
+        "追多边界(AH)",
+    ]
+
+    # 2. 循环遍历数据池，将每一行存入二维列表中
+    table_rows = []
+    for days in periods_pool:
+        res = results_board[days]
+        if days <= 5:
+            name_str = f"{days}天短线历史"
+        else:
+            name_str = (
+                f"20日线(月度)"
+                if days == 20
+                else (
+                    f"60日线(季度)"
+                    if days == 60
+                    else (f"120日线(半年)" if days == 120 else f"250日线(年度)")
+                )
+            )
+
+        table_rows.append(
+            [
+                name_str,
+                float(res["final_poc"]),
+                float(res["true_cdp"]),
+                float(res["al_poc"]),
+                float(res["nl_poc"]),
+                float(res["nh_poc"]),
+                float(res["ah_poc"]),
+            ]
+        )
+
+    # 将二维列表转为 DataFrame 备用
+    excel_data = pd.DataFrame(table_rows, columns=headers)
+
+    # ======================
+    # 写入Excel模板
+    # ======================
+
+    # 加载模板，保留 VBA 宏
+    wb = load_workbook(template_path, keep_vba=True)
+    ws = wb["Sheet1"]
+
+    # 清空旧数据
+    ws.delete_rows(1, ws.max_row)
+
+    # 【第一行第一列】：输出结束日期 end_date（第一行的其余列保持空白）
+    ws.cell(row=1, column=1, value=end_date)
+
+    # 【第二行】：输出追加的股票属性表头
+    info_headers = ["股票代码", "股票名称", "收盘价", "最高价", "最低价"]
+    for col_idx, header_val in enumerate(info_headers, start=1):
+        ws.cell(row=2, column=col_idx, value=header_val)
+
+    # 【第三行】：输出对应的实际股票基本数据值
+    info_values = [
+        target_stock,
+        stock_name,
+        float(stock_metrics_close_p),
+        float(stock_metrics_high_p),
+        float(stock_metrics_low_p),
+    ]
+    for col_idx, value in enumerate(info_values, start=1):
+        ws.cell(row=3, column=col_idx, value=value)
+
+    # 【第四行】：输出之前的 CDP/POC 数据的字段表头
+    for col_idx, header in enumerate(excel_data.columns, start=1):
+        ws.cell(row=4, column=col_idx, value=header)
+
+    # 【第五行及以后】：依次无缝输出具体的 POC 数据行
+    for row_offset, row in enumerate(
+        excel_data.itertuples(index=False), start=5
+    ):
+        for col_idx, value in enumerate(row, start=1):
+            ws.cell(row=row_offset, column=col_idx, value=value)
+
+    # 生成动态文件名
+    excel_path = f"{target_stock}_{stock_name}_{end_date}.xlsm"
+
+    # 保存文件
+    wb.save(excel_path)
+    print(f"{excel_path} 保存完成")
