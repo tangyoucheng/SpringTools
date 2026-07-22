@@ -11,6 +11,7 @@ from tabulate import tabulate
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 假设 stock_dict 从配置中导入，若本地测试可自行定义
 from CDP_poc_config import stock_dict, OUTPUT_END_DATE
+from export_cdp_to_excel import export_cdp_to_excel
 
 # 导入上面写好的核心逻辑组件
 from cdp_poc_total_ATR import execute_all_period_pipeline, get_stock_metrics_by_calendar
@@ -145,9 +146,9 @@ if __name__ == "__main__":
             
         print(
             f"【{target_stock} {stock_name}】 " + 
-            f" 盘中当前{stock_metrics_actual_date}最新价 : {stock_metrics_close_p:.2f} 元  (最高: {stock_metrics_high_p:.2f} | 最低: {stock_metrics_low_p:.2f})"
+            f" 盘中当前最新价 : {stock_metrics_close_p:.2f} 元  (最高: {stock_metrics_high_p:.2f} | 最低: {stock_metrics_low_p:.2f})"
         )
-                
+        export_cdp_to_excel(periods_pool,results_board,target_stock,stock_name,stock_metrics_close_p,stock_metrics_high_p,stock_metrics_low_p,CHOSEN_END_DATE)        
         # 1. 定义统一的表头（直接写文字，无需任何宽度指定）
         headers = [
             "周期类型",
