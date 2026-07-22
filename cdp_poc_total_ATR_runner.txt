@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from CDP_poc_config import stock_dict, OUTPUT_END_DATE
 
 # 导入上面写好的核心逻辑组件
-from cdp_poc_total_ATR import execute_all_period_pipeline
+from cdp_poc_total_ATR import execute_all_period_pipeline, get_stock_metrics_by_calendar
 
 if __name__ == "__main__":
     # =========================================================================
@@ -42,8 +42,19 @@ if __name__ == "__main__":
         # 🤖 核心新增功能测试：在此指定你想截至的历史具体日期 (格式必须为 "YYYY-MM-DD")
         # 如果您想偶尔直接看今天最新的收盘价，请无条件将其【置为 None】(例如: CHOSEN_END_DATE = None)
         #CHOSEN_END_DATE = None  
-        #CHOSEN_END_DATE = "2026-07-21"
-        CHOSEN_END_DATE = OUTPUT_END_DATE        
+        #CHOSEN_END_DATE = "2026-07-21"    
+        CHOSEN_END_DATE = OUTPUT_END_DATE   
+
+        if CHOSEN_END_DATE is not None:
+            stock_metrics_result = get_stock_metrics_by_calendar(target_stock, CHOSEN_END_DATE)
+        else:
+            stock_metrics_result = get_stock_metrics_by_calendar(target_stock, datetime.datetime.now())
+        stock_metrics_actual_date = stock_metrics_result["Actual_Date"]
+        stock_metrics_close_p = stock_metrics_result["Close"]
+        stock_metrics_high_p = stock_metrics_result["High"]
+        stock_metrics_low_p = stock_metrics_result["Low"]        
+        
+        CHOSEN_END_DATE = stock_metrics_actual_date       
         
         print(f"🏁 全周期 ATR 自适应量化引擎已启动...")
         if CHOSEN_END_DATE is not None:
@@ -62,7 +73,7 @@ if __name__ == "__main__":
             target_end_dt = now_clock
             start_date_past = target_end_dt - datetime.timedelta(days=400)
             download_end_dt = target_end_dt
-
+        
         # 2. 抓取多日大周期历史日线数据
         print(f"📡 正在调取 【{target_stock} {stock_name}】 交易所底仓K线流数据...")
         df_daily_raw = yf.download(target_stock, start=start_date_past, end=download_end_dt, interval="1d", progress=False)
@@ -129,7 +140,13 @@ if __name__ == "__main__":
             print(f"【{days}天线周期审计日志】: {results_board[days]['audit_status']}")
             
         log_date_str = CHOSEN_END_DATE if CHOSEN_END_DATE is not None else now_clock.strftime('%Y-%m-%d')
-        print("\n" + "🏁" * 15 + f" 【{log_date_str}】全周期量化终判对齐战略总看板 " + "🏁" * 15)
+        print("\n" + "🏁" * 15 + f" 【{log_date_str}】全周期量化终判对齐战略总看板 " + "🏁" * 15)        
+            
+        print(
+            f"【{target_stock} {stock_name}】 " + 
+            f" 盘中当前{stock_metrics_actual_date}最新价 : {stock_metrics_close_p:.2f} 元  (最高: {stock_metrics_high_p:.2f} | 最低: {stock_metrics_low_p:.2f})"
+        )
+        
         header = f"{'周期类型':<14} | {'智能审定真POC':<12} | {'中轴(CDP)':<10} | {'止损边界(AL)':<10} | {'低吸支撑(NL)':<10} | {'高抛阻力(NH)':<10} | {'追多边界(AH)':<10}"
         print("-" * 115)
         print(header)
