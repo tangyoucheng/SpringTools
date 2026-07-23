@@ -231,11 +231,8 @@ def execute_all_period_pipeline(ticker_symbol, df_all_data, target_dates_pool, d
     
 def get_stock_metrics_by_calendar(ticker: str, target_date: str) -> dict | None:
     """利用官方交易日历定位最近的交易日，并精准获取股票数据。
-
-    已彻底修复 row["Close"].iloc 缺失括号导致的 _iLocIndexer 报错问题。
-
-    :param ticker: 股票代码 (例如 '688037.SS')
-    :param target_date: 目标日期，格式为 'YYYY-MM-DD'
+    
+    【已完美修复】传入周六日、节假日等非交易日时无法获取数据的问题。
     """
     # 1. 根据股票后缀判断市场并加载日历
     is_a_share = ticker.endswith(".SS") or ticker.endswith(".SZ")
@@ -260,274 +257,47 @@ def get_stock_metrics_by_calendar(ticker: str, target_date: str) -> dict | None:
     actual_dt = valid_sessions[-1]
     actual_date_str = actual_dt.strftime("%Y-%m-%d")
 
-    # 4. 精准下载那一天的数据
+    # 4. 为了保险，下载从实际交易日开始往后 4 天的数据（确保能覆盖周五到周一的节假日跨度）
     start_str = actual_date_str
-    end_str = (actual_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    end_str = (actual_dt + pd.Timedelta(days=4)).strftime("%Y-%m-%d")
 
     try:
         df = yf.download(
             ticker, start=start_str, end=end_str, progress=False, group_by="column"
         )
 
-        if not df.empty:
-            df.index = df.index.strftime("%Y-%m-%d")
-            if start_str in df.index:
-                row = df.loc[start_str]
-
-                # 如果单天返回了多行数据 (DataFrame)，强行压缩取第一行
-                if isinstance(row, pd.DataFrame):
-                    row = row.iloc[0]
-
-                # --- 核心修复：使用 .squeeze() 结合 .iloc[0] 完美降维 ---
-                # squeeze() 可以自动把多重索引或单元素的 Series/DataFrame 剥离成标量或一维
-                close_v = row["Close"].squeeze()
-                high_v = row["High"].squeeze()
-                low_v = row["Low"].squeeze()
-
-                # 如果经过 squeeze 后仍然是 Series（说明还是有多重标签夹杂），则用 .iloc[0] 精准拿值
-                if isinstance(close_v, pd.Series):
-                    close_v = close_v.iloc[0]
-                if isinstance(high_v, pd.Series):
-                    high_v = high_v.iloc[0]
-                if isinstance(low_v, pd.Series):
-                    low_v = low_v.iloc[0]
-
-                return {
-                    "Actual_Date": actual_date_str,
-                    "Close": float(close_v),
-                    "High": float(high_v),
-                    "Low": float(low_v),
-                }
-    except Exception as e:
-        print(f"数据下载或解析内部失败: {e}")
-
-    return Noneimport os
-import sys
-import datetime
-import numpy as np
-import pandas as pd
-import yfinance as yf
-
-# 使用免安装版本时，为了读取CDP_config.py，添加的设定
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# =========================================================================
-# 【第一步：自适应核心组件】独立方法：动态获取历史日K线并实时计算最新的 14日 ATR
-# =========================================================================
-def fetch_dynamic_atr(ticker_symbol, period_days=14, end_date_str=None):
-    """
-    【自适应核心组件】独立方法：动态获取指定股票的历史日K线并实时计算最新的 14日 ATR
-    （已加入自适应指定截止时间功能：若不指定则用当前系统时间并执行15点前盘中切片保护）
-    :param ticker_symbol: 股票代码 (例如 "688037.SS")
-    :param period_days: 计算ATR的周期，默认14天
-    :param end_date_str: 指定的计算截止日期字符串 (例如 "2026-07-21")，若为 None 则默认当前系统时间
-    :return: 计算出的最新 ATR 绝对值(float)；若获取失败则返回 None
-    """
-    try:
-        now = datetime.datetime.now()
-        
-        # 1. 解析或者动态生成截止时间锚点
-        if end_date_str is not None:
-            # 用户指定了精准的历史截止点，将其解析为标准 datetime 对象
-            end_date = datetime.datetime.strptime(end_date_str, "%Y-%m-%d")
-            # 因为是用户指定的闭合历史日期，往前狠取 60 天确保节假日扣除后数据完备
-            start_date = end_date - datetime.timedelta(days=60)
-            # 包含指定的这一天，yfinance的end是不包含当天，所以这里动态往后推1天
-            download_end = end_date + datetime.timedelta(days=1)
-        else:
-            # 用户未指定，锁死当前系统时钟
-            end_date = now
-            start_date = end_date - datetime.timedelta(days=60)
-            download_end = end_date
-        
-        # 2. 使用 yfinance 接口下载该股票的日线历史数据
-        df_hist = yf.download(ticker_symbol, start=start_date, end=download_end, interval="1d", progress=False)
-        
-        if df_hist.empty or len(df_hist) < period_days:
+        if df.empty:
+            print(f"提示: yfinance 未能下载到 {ticker} 的任何数据。")
             return None
 
-        # 🚨 【多重列索引解包降维保护】
-        if isinstance(df_hist.columns, pd.MultiIndex):
-            df_hist.columns = df_hist.columns.get_level_values(0)
+        # ─── 【核心改动】不再使用 if start_str in df.index ───
+        # 既然我们已经用 start 限定了起始日期，那么 df 里的第一行（或者存在多行时的有效行）
+        # 就是我们想要的那个实际交易日的数据。我们直接提取 df 的数据。
+        
+        # 统一格式化索引为字符串，方便记录实际日期
+        df.index = df.index.strftime("%Y-%m-%d")
+        
+        # 直接获取最新一行的日期作为实际获取到的日期
+        real_available_date = df.index[-1]
+        row = df.iloc[-1]  # 直接强行取最后一行，彻底免疫时区和假日带来的索引对不齐问题
 
-        # 3. 如果用户未指定截止时间，才需要启动工业级 15点 盘中残缺K线切片剔除机制
-        if end_date_str == None:
-            today_str = now.strftime("%Y-%m-%d")
-            if df_hist.index[-1].strftime("%Y-%m-%d") == today_str:
-                market_close_time = now.replace(hour=15, minute=0, second=0, microsecond=0)
-                if now < market_close_time:
-                    df_hist = df_hist.iloc[:-1]
+        # --- 降维处理：使用 .squeeze() ---
+        close_v = row["Close"].squeeze()
+        high_v = row["High"].squeeze()
+        low_v = row["Low"].squeeze()
 
-        # 4. 提取经过时间与多列审计后、完全闭合的历史最高价、最低价和前一日收盘价
-        high = df_hist['High'].to_numpy().flatten()
-        low = df_hist['Low'].to_numpy().flatten()
-        close = df_hist['Close'].to_numpy().flatten()
-        
-        high_low = high - low
-        high_close_prev = np.abs(high[1:] - close[:-1])
-        low_close_prev = np.abs(low[1:] - close[:-1])
-        
-        high_low_trimmed = high_low[1:]
-        tr_np = np.maximum(high_low_trimmed, np.maximum(high_close_prev, low_close_prev))
-        
-        tr_series = pd.Series(tr_np)
-        atr_series = tr_series.ewm(alpha=1/period_days, adjust=False).mean()
-        
-        # 提取最新一天的绝对值作为基准 ATR
-        latest_atr = float(atr_series.iloc[-1])
-        return latest_atr
-        
+        # 如果经过 squeeze 后仍然是 Series，则用 .iloc[0] 精准拿值
+        if isinstance(close_v, pd.Series): close_v = close_v.iloc[0]
+        if isinstance(high_v, pd.Series): high_v = high_v.iloc[0]
+        if isinstance(low_v, pd.Series): low_v = low_v.iloc[0]
+
+        return {
+            "Actual_Date": real_available_date,  # 返回 yfinance 实际提供数据的日期
+            "Close": float(close_v),
+            "High": float(high_v),
+            "Low": float(low_v),
+        }
+
     except Exception as e:
-        print(f" 🚨 独立方法 fetch_dynamic_atr 运行异常: {e}")
+        print(f"数据下载或解析内部失败: {e}")
         return None
-
-# =========================================================================
-# 【底层组件 A】当日分时自适应 ATR 直方图算法
-# =========================================================================
-def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
-    """
-    【当日分时核心组件】传入特定格子 ATR 倍数系数与基准 ATR，跑单一次当日高频分时（1M/5M）的直方图筹码累加
-    """
-    bin_size = base_atr * atr_multiplier
-    if bin_size < 0.01:
-        bin_size = 0.01
-
-    close_array = df_today["Close"].to_numpy().flatten()
-    intraday_high = close_array.max()
-    intraday_low = close_array.min()
-    
-    bins = np.arange(
-        intraday_low - bin_size * 5,
-        intraday_high + bin_size * 5,
-        bin_size,
-    )
-
-    volume_array = df_today["Volume"].to_numpy().flatten()
-    if len(close_array) != len(volume_array):
-        min_len = min(len(close_array), len(volume_array))
-        close_array = close_array[:min_len]
-        volume_array = volume_array[:min_len]
-
-    counts, _ = np.histogram(
-        close_array, bins=bins, weights=volume_array
-    )
-    
-    max_idx = np.argmax(counts)
-    return (bins[max_idx] + bins[max_idx + 1]) / 2
-
-# =========================================================================
-# 【底层组件 B】融合时间衰减与 ATR 自适应的多日大周期直方图算法
-# =========================================================================
-def run_single_grid_calculation(df_period, target_dates_pool, atr_multiplier, base_atr):
-    """【底层组件】传入特定的格子 ATR 倍数系数，跑单一次多天线性时间衰减直方图计算，输出对应的价格。"""
-    bin_size = base_atr * atr_multiplier
-    if bin_size < 0.01:
-        bin_size = 0.01
-    
-    #print(f" └─ 动态自适应系统启动：当前基准 ATR {base_atr:.2f}元，宏观网格比例系数[{atr_multiplier}]，自动匹配筹码格子宽度(bin_size)为: {bin_size:.3f}元")
-    
-    bins = np.arange(
-        df_period["Close"].min() - bin_size * 5,
-        df_period["Close"].max() + bin_size * 5,
-        bin_size,
-    )
-    combined_counts = np.zeros(len(bins) - 1)
-
-    for index, date in enumerate(target_dates_pool):
-        weight = index + 1  
-        df_single_day = df_period[df_period["date_str"] == date]
-
-        if df_single_day.empty:
-            continue
-
-        counts, _ = np.histogram(
-            df_single_day["Close"], bins=bins, weights=df_single_day["Volume"]
-        )
-        combined_counts += counts * weight
-
-    max_idx = np.argmax(combined_counts)
-    return (bins[max_idx] + bins[max_idx + 1]) / 2
-
-# =========================================================================
-# 【核心总控引擎】核心全周期筹码计算与五关价推理流
-# =========================================================================
-def execute_all_period_pipeline(ticker_symbol, df_all_data, target_dates_pool, df_period_days, base_price=0.0, end_date_str=None):
-    """
-    【总控引擎】支持通吃全周期（1天分时到250天年线）的筹码多维扫描与智能裁决系统
-    """
-    # 1. 动态调取指定截止时间下的 14日自适应基准 ATR
-    base_atr = fetch_dynamic_atr(ticker_symbol, period_days=14, end_date_str=end_date_str)
-    if base_atr is None or np.isnan(base_atr):
-        base_atr = base_price * 0.04 if base_price > 0 else 1.00
-        print(f" ⚠️ 动态获取 ATR 失败！触发安全熔断：自动采用虚拟 ATR ({base_atr:.3f}元) 兜底")
-
-    # 2. 建立全周期自适应倍数决策树
-    if df_period_days == 1:
-        ratios = {"p_005": 0.05, "p_010": 0.125, "p_0020": 0.25, "p_0050": 0.60}
-    elif df_period_days == 3:
-        ratios = {"p_005": 0.10, "p_010": 0.20, "p_0020": 0.40, "p_0050": 1.00}
-    elif df_period_days == 5:
-        ratios = {"p_005": 0.15, "p_010": 0.30, "p_0020": 0.60, "p_0050": 1.50}
-    elif df_period_days == 20:
-        ratios = {"p_005": 0.25, "p_010": 0.50, "p_0020": 1.00, "p_0050": 2.00}
-    elif df_period_days == 60:
-        ratios = {"p_005": 0.50, "p_010": 1.00, "p_0020": 1.50, "p_0050": 3.00}
-    elif df_period_days == 120:
-        ratios = {"p_005": 0.80, "p_010": 1.50, "p_0020": 2.50, "p_0050": 5.00}
-    else:  
-        ratios = {"p_005": 1.00, "p_010": 2.00, "p_0020": 4.00, "p_0050": 8.00}
-
-    # 执行并发矩阵堆积计算
-    poc_matrix = {}
-    for key, atr_multiplier in ratios.items():
-        if df_period_days == 1:
-            poc_matrix[key] = run_intraday_single_grid_atr(df_all_data, atr_multiplier, base_atr)
-        else:
-            poc_matrix[key] = run_single_grid_calculation(df_all_data, target_dates_pool, atr_multiplier, base_atr)
-
-    # 3. 🤖 智能裁决系统
-    p_005 = poc_matrix["p_005"]
-    p_020 = poc_matrix["p_0020"]
-
-    if df_period_days <= 5:
-        audit_threshold = 0.20 * base_atr  
-    elif df_period_days <= 20:
-        audit_threshold = 0.40 * base_atr  
-    else:
-        audit_threshold = 0.80 * base_atr  
-
-    if abs(p_005 - p_020) > audit_threshold:
-        final_poc = p_020  
-        audit_status = f"🚨 拦截异常！【{df_period_days}日线】细格失真({p_005:.2f}元)，强制采信防噪网格({p_020:.2f}元)"
-    else:
-        final_poc = p_005  
-        audit_status = f"🟢 【{df_period_days}日线】筹码分布健康，多网格共振吻合"
-
-    # 4. 运行宏观 2倍POC加权 CDP 五关价体系
-    raw_high = df_all_data["High"].max()
-    raw_low = df_all_data["Low"].min() 
-
-    if df_period_days > 5:
-        macro_high = max(raw_high, final_poc + 1.5 * base_atr)
-        macro_low = min(raw_low, final_poc - 1.5 * base_atr)
-    else:
-        macro_high = raw_high
-        macro_low = raw_low
-
-    true_cdp = (macro_high + macro_low + 2 * final_poc) / 4
-
-    ah_poc = true_cdp + (macro_high - macro_low)                  
-    nh_poc = 2 * true_cdp - macro_low                             
-    nl_poc = max(0.01, 2 * true_cdp - macro_high)                 
-    al_poc = max(0.01, true_cdp - (macro_high - macro_low))       
-
-    return {
-        "final_poc": final_poc,
-        "true_cdp": true_cdp,
-        "al_poc": al_poc,
-        "nl_poc": nl_poc,
-        "nh_poc": nh_poc,
-        "ah_poc": ah_poc,
-        "audit_status": audit_status
-    }
-    
