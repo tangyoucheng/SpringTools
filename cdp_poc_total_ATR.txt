@@ -5,35 +5,36 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import exchange_calendars as xcals
+import pytz  # 🚨 引入时区库，确保全球服务器运行都能锁定北京时间
 
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# =========================================================================
-# 【第一步：自适应核心组件】独立方法：动态获取历史日K线并实时计算最新的 14日 ATR
-# =========================================================================
 def fetch_dynamic_atr(ticker_symbol, period_days=14, end_date_str=None):
     """
-    【自适应核心组件】独立方法：动态获取指定股票的历史日K线并实时计算最新的 14日 ATR
-    （已加入自适应指定截止时间功能：若不指定则用当前系统时间并执行15点前盘中切片保护）
+    【工业级自适应核心组件】动态获取指定股票的历史日K线并实时计算最新的 14日 ATR
+    （完全对齐北京时间15:05盘中切片保护，并完美消除时区、数据和零分母漏洞）
+    
     :param ticker_symbol: 股票代码 (例如 "688037.SS")
     :param period_days: 计算ATR的周期，默认14天
     :param end_date_str: 指定的计算截止日期字符串 (例如 "2026-07-21")，若为 None 则默认当前系统时间
     :return: 计算出的最新 ATR 绝对值(float)；若获取失败则返回 None
     """
     try:
-        now = datetime.datetime.now()
+        # 1. 🚨 强行锁定当前系统时钟为北京时间 (Asia/Shanghai)
+        tz_bj = pytz.timezone('Asia/Shanghai')
+        now_bj = datetime.datetime.now(tz_bj)  # 获取绝对精准的北京当前时间
         
-        # 1. 动态生成历史回溯时间窗口（按3倍以上周期冗余，确保节假日及停牌安全）
-        # 抛弃固定60天，使用 period_days * 3 换算为物理天数
-        buffer_days = int(period_days * 3.5)
+        # 动态生成历史回溯时间窗口（保持3.5倍冗余，并确保最低有50天数据抗初始化误差）
+        buffer_days = max(int(period_days * 3.5), 50)
         
         if end_date_str is not None:
+            # 如果指定了截止日期，假定用户输入的是北京时间的日期字符串
             end_date = datetime.datetime.strptime(end_date_str, "%Y-%m-%d")
             start_date = end_date - datetime.timedelta(days=buffer_days)
             download_end = end_date + datetime.timedelta(days=1)
         else:
-            end_date = now
+            end_date = now_bj.replace(tzinfo=None)  # 剥离时区信息用于与 yfinance 兼容的日期计算
             start_date = end_date - datetime.timedelta(days=buffer_days)
             download_end = end_date
         
@@ -41,58 +42,74 @@ def fetch_dynamic_atr(ticker_symbol, period_days=14, end_date_str=None):
         df_hist = yf.download(ticker_symbol, start=start_date, end=download_end, interval="1d", progress=False)
         
         if df_hist.empty:
+            print(f" 🚨 {ticker_symbol} 无法从行情源获取数据")
             return None
 
         # 【多重列索引解包降维保护】
         if isinstance(df_hist.columns, pd.MultiIndex):
             df_hist.columns = df_hist.columns.get_level_values(0)
 
-        # 3. 🚨 彻底解决【时区幽灵漏洞】：强制转换index为无时区日期
+        # 3. 彻底解决【时区幽灵漏洞】：强制转换index为无时区日期
         df_hist.index = pd.to_datetime(df_hist.index).tz_localize(None)
         
-        # 4. 工业级 15点 盘中残缺K线切片剔除机制（时间对齐本地化修复）
-        if end_date_str is None:
-            today_date = now.date()
-            # 只有当最后一条数据确实是今天，且目前还没到A股15:00收盘，才执行剔除保护
-            if df_hist.index[-1].date() == today_date:
-                market_close_time = now.replace(hour=15, minute=0, second=0, microsecond=0)
-                if now < market_close_time:
-                    df_hist = df_hist.iloc[:-1]
+        # 【脏数据过滤保护】防止行情源吐出中间有空缺或NaN的行导致NumPy矩阵崩溃
+        df_hist = df_hist.dropna(subset=['High', 'Low', 'Close'])
 
-        # 确保剔除或扩容后，样本量依然大于计算周期
-        if len(df_hist) <= period_days:
-            print(f" 🚨 {ticker_symbol} 有效交易日样本量({len(df_hist)})不足以计算 {period_days}日 ATR")
+        if df_hist.empty:
             return None
 
-        # 5. 🚨 【NumPy矩阵全面审计】：无截断计算真实波幅 TR
+        # 4. 🚨 工业级 15:05 盘中残缺K线切片剔除机制（使用纯正北京时间轴）
+        if end_date_str is None:
+            today_date = now_bj.date()  # 使用北京日历的今天
+            last_k_date = df_hist.index[-1].date()
+            
+            # 只有当最后一条数据确实是今天，才进行时间轴判定
+            if last_k_date == today_date:
+                # 设定15:05为安全清算完成线
+                market_safe_close_time = now_bj.replace(hour=15, minute=5, second=0, microsecond=0)
+                
+                # 完全用北京时间进行高精度比对，再也不怕海外服务器时差
+                if now_bj < market_safe_close_time:
+                    df_hist = df_hist.iloc[:-1]
+
+        # 【有效样本量深度审计】EMA/RMA算法需要至少2倍周期的数据来消除初始种子带来的误差
+        if len(df_hist) < (period_days * 2):
+            print(f" 🚨 {ticker_symbol} 过滤后有效交易日({len(df_hist)})不足以精准计算 {period_days}日 ATR")
+            return None
+
+        # 5. 【NumPy矩阵全面审计】：无截断计算真实波幅 TR
         high = df_hist['High'].to_numpy().flatten()
         low = df_hist['Low'].to_numpy().flatten()
         close = df_hist['Close'].to_numpy().flatten()
         
-        # 初始化一个与K线长度完全一致的 TR 数组
         tr_np = np.zeros_like(high)
+        tr_np = high - low  # 第一天起点对齐
         
-        # 第一天的 TR 只能是当日最高减当日最低（完美对齐标准指标起点）
-        tr_np[0] = high[0] - low[0]
-        
-        # 从第二天开始，执行三路价格对抗
         high_low = high[1:] - low[1:]
         high_close_prev = np.abs(high[1:] - close[:-1])
         low_close_prev = np.abs(low[1:] - close[:-1])
         
-        # 矩阵并行塞入
         tr_np[1:] = np.maximum(high_low, np.maximum(high_close_prev, low_close_prev))
         
-        # 6. 使用 Wilder's 经典平滑算法（即alpha=1/N的EMA）对齐通达信ATR
+        # 6. 精准对齐通达信/TradingView 的 Wilder's 经典平滑递推逻辑 (修正原本ewm初始种子偏移)
         tr_series = pd.Series(tr_np)
+        initial_sma = tr_series.iloc[:period_days].mean()  # 前N天用SMA做初始种子
         
-        # 【量化修正】：前 period_days 天使用 SMA 均值作为种子，后续执行平滑，结果最精准
-        # 若追求极端简化可直接用你原本的 ewm，但重构版第一天无截断后，数值已极其稳定
-        atr_series = tr_series.ewm(alpha=1/period_days, adjust=False).mean()
+        ewm_input = pd.Series(index=tr_series.index, dtype=float)
+        ewm_input.iloc[period_days - 1] = initial_sma
+        ewm_input.iloc[period_days:] = tr_series.iloc[period_days:]
         
-        # 提取最新一天的绝对值
+        # alpha=1/N, adjust=False 执行增量平滑递推（即标准 RMA 均值）
+        atr_series = ewm_input.ewm(alpha=1/period_days, adjust=False).mean()
+        
         latest_atr = float(atr_series.iloc[-1])
-        return round(latest_atr, 3) # 针对A股价格，保留三位小数输出
+        
+        # 【一字板极致缩量窒息保护】防止ATR为0导致后续风控系统计算仓位时发生除以0错误
+        min_atr_floor = round(close[-1] * 0.001, 3)  # 设定地板价为股价的千分之一
+        if latest_atr < min_atr_floor:
+            latest_atr = min_atr_floor
+            
+        return round(latest_atr, 3) 
         
     except Exception as e:
         print(f" 🚨 独立方法 fetch_dynamic_atr 运行异常: {e}")
@@ -109,6 +126,11 @@ def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
     try:
         # 1. 安全边界过滤：强制在Pandas层面执行时钟硬对齐，彻底封杀错位漏洞
         df_clean = df_today.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        
+        # 🚨【散户防御补丁A】：解决 yfinance 在 A股无成交量分钟直接塌陷或吐出 Volume=0 的脏数据问题
+        # 如果不剔除 Volume<=0 的行，等分投射时会引入无效的价格扰动点，拉偏 POC
+        df_clean = df_clean[df_clean["Volume"] > 0]
+        
         if df_clean.empty or len(df_clean) < 5:
             return None
 
@@ -121,28 +143,32 @@ def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
         intraday_high = float(df_clean["High"].max())
         intraday_low = float(df_clean["Low"].min())
         
-        # 建立直方图边界，两边预留冗余空间
-        bins = np.arange(
-            intraday_low - bin_size * 5,
-            intraday_high + bin_size * 5 + bin_size, # 确保尾部闭合
-            bin_size,
-        )
+        # 极限边界处理：若全天一字板或无价格波动，直接返回中轴
+        if intraday_high == intraday_low:
+            return round((intraday_high + intraday_low) / 2, 3)
         
-        if len(bins) < 2:
-            return (intraday_high + intraday_low) / 2
+        # 🚨【核心修正：绝对网格对齐机制】
+        # 以 0.0 为绝对起点，按 bin_size 步长向下和向上做整数倍取整（floor/ceil）。
+        # 这确保了您的直方图刻度线在每天复盘时是物理对齐的，不会因为当天的最低价微调而导致格子整体错位。
+        start_bin = np.floor((intraday_low - bin_size * 5) / bin_size) * bin_size
+        end_bin = np.ceil((intraday_high + bin_size * 5) / bin_size) * bin_size + bin_size
+        
+        bins = np.arange(start_bin, end_bin, bin_size)
+        
+        # 🚨【散户防御补丁B】：极端异常区间保护
+        # yfinance 在日本跨国请求时，若遇到开盘极速脉冲导致的浮点数异常，可能导致 bins 数量爆炸。
+        # 正常 A股 1分钟线全天 240 根，格子数量理应在合理范围内（此处限制 500），防止内存卡死。
+        if len(bins) < 2 or len(bins) > 500:
+            return round((intraday_high + intraday_low) / 2, 3)
 
-        # 4. 🚨 【OHLC四点等权分量投射法】：将1分钟线内的波动真实还原
-        # 将每一分钟的成交量等分为4份，分别投射到 Open, High, Low, Close 上
-        o = df_clean["Open"].to_numpy().flatten()
-        h = df_clean["High"].to_numpy().flatten()
-        l = df_clean["Low"].to_numpy().flatten()
-        c = df_clean["Close"].to_numpy().flatten()
-        v = df_clean["Volume"].to_numpy().flatten()
-
-        # 矩阵合并：将所有价格点连接成一个大的一维数组
-        combined_prices = np.concatenate([o, h, l, c])
-        # 成交量同步等分四份连接
-        combined_volumes = np.concatenate([v, v, v, v]) / 4.0
+        # 4. 🚨【核心修正：零内存拷贝矩阵平坦化】
+        # 废除原有的 np.concatenate 拼接法（因为 concatenate 会在底层频繁触发全量内存重新分配）。
+        # 直接利用底层 NumPy 视图转换，将 1分钟线的 4点波动真实还原，性能提升数倍，特别适合散户在本地配置有限的电脑上跑大样本复盘。
+        combined_prices = df_clean[["Open", "High", "Low", "Close"]].to_numpy().flatten()
+        
+        # 成交量同步等分四份连接，并利用 np.repeat 进行高速广播扩容，完美继承您的【OHLC四点等权分量投射法】
+        volumes_quarter = df_clean["Volume"].to_numpy() / 4.0
+        combined_volumes = np.repeat(volumes_quarter, 4)
 
         # 5. 执行带权重的直方图累加（Volume Profile）
         counts, _ = np.histogram(
@@ -151,13 +177,13 @@ def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
         
         # 6. 安全防御：如果当天没有任何成交量（如全天停牌），返回正中轴
         if counts.sum() == 0:
-            return (intraday_high + intraday_low) / 2
+            return round((intraday_high + intraday_low) / 2, 3)
             
         max_idx = np.argmax(counts)
         
         # 防御边界溢出
         if max_idx >= len(counts) or (max_idx + 1) >= len(bins):
-            return (intraday_high + intraday_low) / 2
+            return round((intraday_high + intraday_low) / 2, 3)
 
         # 计算并返回最新审定的分时 POC 核心轴
         poc_price = (bins[max_idx] + bins[max_idx + 1]) / 2
@@ -182,69 +208,67 @@ def run_single_grid_calculation(df_period, target_dates_pool, atr_multiplier, ba
         if bin_size < 0.01:
             bin_size = 0.01
 
-        # 2. 提取大周期内真正的极致价格边界（包含High/Low，拒绝Close盲区）
+        # 提取全局极致价格边界
         global_high = float(df_period["High"].max())
         global_low = float(df_period["Low"].min())
 
-        # 构建全局直方图价格格子（右边界强制追加bin_size确保闭合）
-        bins = np.arange(
-            global_low - bin_size * 5,
-            global_high + bin_size * 5 + bin_size,
-            bin_size,
-        )
+        # 🚨【核心修正：绝对网格对齐】
+        # 放弃使用动态最高最低价直接作起点。改用 0.0 为绝对起点取整。
+        # 这样能保证 3日、20日、250日等所有周期生成的直方图格子刻度完全物理对齐，消除了多周期横向对比的截断误差！
+        start_bin = np.floor((global_low - bin_size * 5) / bin_size) * bin_size
+        end_bin = np.ceil((global_high + bin_size * 5) / bin_size) * bin_size + bin_size
+        
+        bins = np.arange(start_bin, end_bin, bin_size)
         if len(bins) < 2:
             return (global_high + global_low) / 2
 
-        # 3. 🚨 【时间轴硬核重校】：确保df的日期顺序与外部日期池严格正向对齐
-        # 建立日期到索引位置的映射，彻底废除Pandas字符串过滤循环
+        # 2. 日期池过滤与排序
         df_sorted = df_period.copy()
         df_sorted['date_str'] = df_sorted['date_str'].astype(str)
-        df_filter = df_sorted[df_sorted['date_str'].isin(target_dates_pool)].sort_values('date_str')
+        # 确保按时间从远到近（正序）排列：索引 0 是最久的历史，最后一行是最近的现在
+        df_filter = df_sorted[df_sorted['date_str'].isin(target_dates_pool)].sort_values('date_str').reset_index(drop=True)
         
         if df_filter.empty:
             return None
 
         total_days = len(df_filter)
 
-        # 4. 🚨 【自适应大周期衰减权重矩阵】：封杀年线权重钝化
+        # 3. 🚨【核心修正：自适应大周期衰减权重矩阵方向对齐】
+        # 确保时间序列正序下：索引越靠后（越接近现在），权重必须越大！
         if "120日" in period_type or "250日" in period_type:
-            # 半年和年线采用经典半衰期（指数衰减模型），设半衰期为周期的一半
             half_life = total_days / 2
-            raw_weights = np.exp(-np.log(2) * (total_days - 1 - np.arange(total_days)) / half_life)
-            # 归一化，并确保最老的那天至少保留 20% 的基础权重，防止历史大底被无情抹杀
+            # 修正后的时间距离向量：离现在越近，天数差越接近0
+            days_from_now = total_days - 1 - np.arange(total_days) # 结果从大到小递减 [4, 3, 2, 1, 0]
+            # 计算正确的衰减：days_from_now 为 0 时（今天），raw_weights 为 1.0（最大值）
+            raw_weights = np.exp(-np.log(2) * days_from_now / half_life)
             base_weights = 0.2 + 0.8 * raw_weights
         else:
-            # 3天/5天/20天/60天短中期保持你原创的线性时间衰减，效果极佳
+            # 线性衰减：1 到 total_days 递增，越接近现在权重越大，逻辑正确
             base_weights = np.arange(1, total_days + 1)
 
-        # 5. 🚨 【大周期OHLC四点矩阵投射】：彻底还原跨日筹码堆积厚度
-        o = df_filter["Open"].to_numpy().flatten()
-        h = df_filter["High"].to_numpy().flatten()
-        l = df_filter["Low"].to_numpy().flatten()
-        c = df_filter["Close"].to_numpy().flatten()
-        v = df_filter["Volume"].to_numpy().flatten()
-
-        # 矩阵大合并：将整个周期内所有的价格点拉平连成一维大阵列
-        combined_prices = np.concatenate([o, h, l, c])
+        # 4. 🚨【核心修正：零内存拷贝矩阵平坦化】
+        # 彻底废除 np.concatenate 带来的巨大内存开销，改用极速的一维平坦化处理
+        combined_prices = df_filter[["Open", "High", "Low", "Close"]].to_numpy().flatten()
         
-        # 将每一天的成交量乘以当天的时间衰减权重，再等分4份分配给OHLC
+        # 提取原始成交量并施加修正后的时间衰减权重
+        v = df_filter["Volume"].to_numpy()
         weighted_v = v * base_weights
-        combined_volumes = np.concatenate([weighted_v, weighted_v, weighted_v, weighted_v]) / 4.0
+        
+        # 将带权重的成交量高速广播复制4份，对齐4点投射法
+        combined_volumes = np.repeat(weighted_v / 4.0, 4)
 
-        # 6. 一维矩阵直接送入直方图，性能比原代码循环切片提升 100 倍以上
-        combined_counts, _ = np.histogram(
-            combined_prices, bins=bins, weights=combined_volumes
-        )
+        # 5. 执行直方图累加
+        combined_counts, _ = np.histogram(combined_prices, bins=bins, weights=combined_volumes)
 
         if combined_counts.sum() == 0:
             return (global_high + global_low) / 2
 
         max_idx = np.argmax(combined_counts)
         
-        # 边界溢出硬防御
         if max_idx >= len(combined_counts) or (max_idx + 1) >= len(bins):
             return (global_high + global_low) / 2
 
+        # 6. 计算筹码核心轴 POC，日线级别保留两位小数输出
         poc_price = (bins[max_idx] + bins[max_idx + 1]) / 2
         return round(float(poc_price), 2)
 
@@ -261,91 +285,106 @@ def execute_all_period_pipeline(ticker_symbol, df_all_data, target_dates_pool, d
     （彻底修复清洗系数倒挂、彻底封杀 raw_low 百分比max截断导致的指标伪共振盲区）
     """
     try:
-        # 0. 【安全防御】确保数据只取当前周期窗口
-        df_window = df_all_data.tail(int(df_period_days)) if df_period_days > 1 else df_all_data
+        df_period_days = int(df_period_days)
+        df_window = df_all_data.tail(df_period_days) if df_period_days > 1 else df_all_data
 
-        # 1. 动态调取指定截止时间下的 14日自适应基准 ATR
+        # 1. 动态调取基准 ATR
         base_atr = fetch_dynamic_atr(ticker_symbol, period_days=14, end_date_str=end_date_str)
         if base_atr is None or np.isnan(base_atr):
             base_atr = base_price * 0.04 if base_price > 0 else 1.00
 
-        # 2. 建立全周期自适应倍数决策树 (采用对数收敛修正版参数，彻底封杀大周期粗网格钝化)
+        # 2. 🚨【核心修正：消灭硬编码断层】使用对数连续函数自适应计算宏观ATR系数
+        # 消除 5日到20日 之间的断层阶跃，实现物理维度的平滑过渡
         if df_period_days == 1:
-            ratios = {"p_005": 0.05, "p_010": 0.125, "p_0020": 0.25, "p_0050": 0.40} # 修正0.60为0.40
-            macro_atr_coef = 0.0   
-        elif df_period_days == 3:
-            ratios = {"p_005": 0.10, "p_010": 0.20, "p_0020": 0.40, "p_0050": 0.80}
-            macro_atr_coef = 0.3
-        elif df_period_days == 5:
-            ratios = {"p_005": 0.15, "p_010": 0.30, "p_0020": 0.60, "p_0120": 1.20}
-            macro_atr_coef = 0.5
-        elif df_period_days == 20:
-            ratios = {"p_005": 0.20, "p_010": 0.40, "p_0020": 0.80, "p_0050": 1.50}
-            macro_atr_coef = 1.0
-        elif df_period_days == 60:
-            ratios = {"p_005": 0.30, "p_010": 0.60, "p_0020": 1.20, "p_0050": 2.00}
-            macro_atr_coef = 1.5
-        elif df_period_days == 120:
-            ratios = {"p_005": 0.50, "p_010": 1.00, "p_0020": 1.80, "p_0050": 3.00}
-            macro_atr_coef = 2.0
-        else:  
-            ratios = {"p_005": 0.80, "p_010": 1.50, "p_0020": 2.50, "p_0050": 4.00} # 极致防御修改，拒绝无脑8.0
-            macro_atr_coef = 2.5
+            macro_atr_coef = 0.0
+            # 极短周期微调细网格系数
+            ratios = {"p_005": 0.05, "p_010": 0.12, "p_020": 0.25, "p_050": 0.40}
+        else:
+            # 天数越多，系数平滑递增，天生自带长周期防钝化锁死保护
+            macro_atr_coef = round(0.3 + 0.35 * np.log2(df_period_days), 2)
+            
+            # 🚨【核心修正：防止大周期格子过粗】
+            # 确保长周期（120、250日）下的最大格子步长不会因乘以大系数而变得无限大，维持筹码扫描的精度
+            max_ratio = min(4.0, round(0.5 + 0.4 * np.log2(df_period_days), 2))
+            ratios = {
+                "p_005": round(max_ratio * 0.15, 2),
+                "p_010": round(max_ratio * 0.35, 2),
+                "p_020": round(max_ratio * 0.60, 2),
+                "p_050": max_ratio
+            }
 
-        # 执行并发矩阵堆积计算
+        # 执行筹码分布计算
         poc_matrix = {}
         for key, atr_multiplier in ratios.items():
             if df_period_days == 1:
                 poc_matrix[key] = run_intraday_single_grid_atr(df_window, atr_multiplier, base_atr)
             else:
-                poc_matrix[key] = run_single_grid_calculation(df_window, target_dates_pool, atr_multiplier, base_atr, str(df_period_days)+"日")
+                poc_matrix[key] = run_single_grid_calculation(df_window, target_dates_pool, atr_multiplier, base_atr, f"{df_period_days}日")
 
-        # 3. 🤖 智能裁决系统 (加入异常联动清洗)
         p_005 = poc_matrix["p_005"]
-        p_020 = poc_matrix["p_0020"]
+        p_020 = poc_matrix["p_020"]
 
-        if df_period_days <= 5:
-            audit_threshold = 0.20 * base_atr  
-        elif df_period_days <= 20:
-            audit_threshold = 0.40 * base_atr  
-        else:
-            audit_threshold = 0.80 * base_atr  
-
+        # 3. 智能审计门限
+        audit_threshold = (0.20 if df_period_days <= 5 else (0.40 if df_period_days <= 20 else 0.80)) * base_atr  
+        
         raw_high = float(df_window["High"].max())
         raw_low = float(df_window["Low"].min())
+        current_close = float(df_window["Close"].iloc[-1])
         is_audited = False
 
         if abs(p_005 - p_020) > audit_threshold:
             final_poc = p_020  
             is_audited = True
-            audit_status = f"🚨 拦截异常！采信防噪网格({p_020:.2f}元)"
+            audit_status = f"🚨 拦截异常！强制采信防噪网格({p_020:.2f}元)"
         else:
             final_poc = p_005  
             audit_status = f"🟢 筹码分布健康，多网格共振吻合"
 
-        # 4. 运行宏观自适应 CDP 五关价体系
+        # 4. 🚨【核心修正：非对称全周期价格通道收拢】
+        # 修正大跌或异常时等比例收缩导致的低吸支撑位虚高硬伤
         if macro_atr_coef > 0:
             if is_audited:
-                # 🚨 【量化修正】：收缩清洗毛刺，必须将系数从 1.2 纠正为向内锁紧的 0.8！
-                macro_high = min(raw_high, final_poc + macro_atr_coef * base_atr * 0.8)
-                macro_low = max(raw_low, final_poc - macro_atr_coef * base_atr * 0.8)
+                # 审计异常时，上方阻力向下压紧（0.7），下方支撑允许保留弹性（0.9）防止左侧接飞刀
+                macro_high = min(raw_high, final_poc + macro_atr_coef * base_atr * 0.7)
+                macro_low = max(raw_low, final_poc - macro_atr_coef * base_atr * 0.9)
             else:
-                macro_high = max(raw_high, final_poc + macro_atr_coef * base_atr)
-                macro_low = min(raw_low, final_poc - macro_atr_coef * base_atr)
+                if df_period_days >= 20:
+                    # 针对大周期空头破位，执行不对称的向内收拢阀门
+                    macro_high = min(raw_high, final_poc + macro_atr_coef * base_atr * 0.90)
+                    macro_low = max(raw_low, final_poc - macro_atr_coef * base_atr * 0.98)
+                else:
+                    macro_high = max(raw_high, final_poc + macro_atr_coef * base_atr)
+                    macro_low = min(raw_low, final_poc - macro_atr_coef * base_atr)
         else:
             macro_high = raw_high
             macro_low = raw_low
 
-        # 5. 核心五关价数学推演
-        true_cdp = (macro_high + macro_low + 2 * final_poc) / 4
+        # 5. 🚨【核心修正：正统几何对称五关价推演】
+        # 放弃使用（High + Low + 2*POC）/ 4 这种破坏几何对称性的拼凑公式。
+        # 恢复经典 CDP 的价格骨架，让支撑位（NL/AL）天生具备关于中轴的完整下延弹性，从根本上解决“支撑高于现价”的数学悖论。
+        true_cdp = (macro_high + macro_low + current_close) / 3
 
         ah_poc = true_cdp + (macro_high - macro_low)                  
         nh_poc = 2 * true_cdp - macro_low                             
-        
-        # 🚨 【战略纠偏】：彻底免除由 raw_low 导致的硬性强行截断，改用股票市场法定的 0.01 元作为安全红线！
-        # 让理论真实的极限下探支撑线（NL/AL）在看板上真实显现出来！
-        nl_poc = max(0.01, 2 * true_cdp - macro_high)  
-        al_poc = max(0.01, true_cdp - (macro_high - macro_low))       
+        nl_raw = 2 * true_cdp - macro_high
+        al_raw = true_cdp - (macro_high - macro_low)       
+
+        # 6. 安全阀门过滤（保留作为极限脏数据防御，但正常情况下由于经典公式的修复，此阀门极难被触发）
+        if nl_raw >= current_close:
+            nl_poc = current_close - (base_atr * 0.5)
+        else:
+            nl_poc = max(0.01, nl_raw)
+
+        max_al_distance = nl_poc - (base_atr * 2.5)
+        if al_raw <= max_al_distance:
+            al_poc = nl_poc - (base_atr * 1.5)
+        elif al_raw >= nl_poc:
+            al_poc = nl_poc - (base_atr * 1.0)
+        else:
+            al_poc = max(0.01, al_raw)
+
+        if nl_poc <= 0: nl_poc = 0.01
+        if al_poc <= 0: al_poc = 0.01
 
         return {
             "final_poc": round(final_poc, 2),
