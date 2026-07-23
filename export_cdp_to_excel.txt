@@ -1,6 +1,30 @@
 import pandas as pd
 from openpyxl import load_workbook
+from enum import Enum
+from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, ROUND_DOWN
 
+class RoundingStyle(Enum):
+    """通用金融舍入定数枚举 (纯数学工具，不绑定任何业务指标)"""
+    
+    ROUND = ROUND_HALF_UP  # 完美的四舍五入
+    CEIL  = ROUND_CEILING  # 完美的直接进位（直接升）
+    FLOOR = ROUND_DOWN     # 完美的直接舍去（直接砍）
+
+    def apply(self, value: float | str | int, decimals: int = 2) -> float:
+        """执行当前定数对应的舍入规则，默认保留 2 位小数"""
+        if value is None:
+            return 0.0
+            
+        dec_val = Decimal(str(value))
+        # 动态构造保留位数模板，例如 2 位就是 '0.01'，4 位就是 '0.0001'
+        places_template = Decimal('1').scaleb(-decimals)
+        
+        # self.value 拿到的就是对应的 ROUND_HALF_UP / ROUND_CEILING / ROUND_DOWN
+        return float(dec_val.quantize(places_template, rounding=self.value))
+        
+
+import pandas as pd
+from openpyxl import load_workbook
 
 def export_cdp_to_excel(
     periods_pool,
@@ -13,7 +37,10 @@ def export_cdp_to_excel(
     end_date,
     template_path="export_cdp_poc_stock_temple.xlsm",
 ):
-    """将股票基本数据与CDP/POC数据无缝写入Excel模板，并在A1输出end_date"""
+    """将股票基本数据与CDP/POC数据无缝写入Excel模板，并在A1输出end_date。
+    
+    【已修改】所有表格数据统一从第二列（B列）开始对齐写入。
+    """
 
     # 1. 定义统一的 CDP 数据表头
     headers = [
@@ -46,12 +73,12 @@ def export_cdp_to_excel(
         table_rows.append(
             [
                 name_str,
-                float(res["final_poc"]),
-                float(res["true_cdp"]),
-                float(res["al_poc"]),
-                float(res["nl_poc"]),
-                float(res["nh_poc"]),
-                float(res["ah_poc"]),
+                RoundingStyle.ROUND.apply(res["final_poc"]),  # 四舍五入
+                RoundingStyle.ROUND.apply(res["true_cdp"]),   # 四舍五入
+                RoundingStyle.FLOOR.apply(res["al_poc"]),     # 直接舍去
+                RoundingStyle.CEIL.apply(res["nl_poc"]),      # 直接进位
+                RoundingStyle.CEIL.apply(res["nh_poc"]),      # 直接进位
+                RoundingStyle.FLOOR.apply(res["ah_poc"]),     # 直接舍去
             ]
         )
 
@@ -69,34 +96,38 @@ def export_cdp_to_excel(
     # 清空旧数据
     ws.delete_rows(1, ws.max_row)
 
-    # 【第一行第一列】：输出结束日期 end_date（第一行的其余列保持空白）
-    ws.cell(row=1, column=1, value=end_date)
+    # 💡 核心控制：定义全局起始列（2 代表 B列）
+    START_COL = 2
 
-    # 【第二行】：输出追加的股票属性表头
+    # 【第一行第一列】：输出结束日期 end_date（第一行的其余列保持空白）
+    # 依然保持在 A1，不受 START_COL 影响
+    ws.cell(row=1, column=START_COL, value=end_date)
+
+    # 【第二行】：输出追加的股票属性表头（从第二列开始）
     info_headers = ["股票代码", "股票名称", "收盘价", "最高价", "最低价"]
-    for col_idx, header_val in enumerate(info_headers, start=1):
+    for col_idx, header_val in enumerate(info_headers, start=START_COL):
         ws.cell(row=2, column=col_idx, value=header_val)
 
-    # 【第三行】：输出对应的实际股票基本数据值
+    # 【第三行】：输出对应的实际股票基本数据值（从第二列开始）
     info_values = [
         target_stock,
         stock_name,
-        float(stock_metrics_close_p),
-        float(stock_metrics_high_p),
-        float(stock_metrics_low_p),
+        RoundingStyle.ROUND.apply(stock_metrics_close_p),  # 四舍五入
+        RoundingStyle.ROUND.apply(stock_metrics_high_p),   # 四舍五入
+        RoundingStyle.ROUND.apply(stock_metrics_low_p),    # 四舍五入
     ]
-    for col_idx, value in enumerate(info_values, start=1):
+    for col_idx, value in enumerate(info_values, start=START_COL):
         ws.cell(row=3, column=col_idx, value=value)
 
-    # 【第四行】：输出之前的 CDP/POC 数据的字段表头
-    for col_idx, header in enumerate(excel_data.columns, start=1):
+    # 【第四行】：输出之前的 CDP/POC 数据的字段表头（从第二列开始）
+    for col_idx, header in enumerate(excel_data.columns, start=START_COL):
         ws.cell(row=4, column=col_idx, value=header)
 
-    # 【第五行及以后】：依次无缝输出具体的 POC 数据行
+    # 【第五行及以后】：依次无缝输出具体的 POC 数据行（从第二列开始）
     for row_offset, row in enumerate(
         excel_data.itertuples(index=False), start=5
     ):
-        for col_idx, value in enumerate(row, start=1):
+        for col_idx, value in enumerate(row, start=START_COL):
             ws.cell(row=row_offset, column=col_idx, value=value)
 
     # 生成动态文件名
