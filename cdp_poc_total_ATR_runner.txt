@@ -47,10 +47,25 @@ if __name__ == "__main__":
         #CHOSEN_END_DATE = "2026-07-21"    
         CHOSEN_END_DATE = OUTPUT_END_DATE   
 
-        if CHOSEN_END_DATE is not None:
-            stock_metrics_result = get_stock_metrics_by_calendar(target_stock, CHOSEN_END_DATE)
-        else:
-            stock_metrics_result = get_stock_metrics_by_calendar(target_stock, datetime.datetime.now())
+        if CHOSEN_END_DATE is None:
+            CHOSEN_END_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        #print(f"正在查询股票 {target_stock} 在今天 ({CHOSEN_END_DATE}) 或最近交易日的数据...")
+        stock_metrics_result = get_stock_metrics_by_calendar(target_stock, CHOSEN_END_DATE)
+        # ─── 安全检查：只有当结果不为 None 时才提取数据 ───
+        #if stock_metrics_result is not None:
+        #    # 这里是原本第 54 行的代码，现在安全了
+        #    stock_metrics_actual_date = stock_metrics_result["Actual_Date"]
+        #    stock_close = stock_metrics_result["Close"]
+        #    
+        #    # ... 在这里继续编写您后续的 ATR 或 CDP 计算逻辑 ...
+        #    print(f"成功获取数据：实际交易日 {stock_metrics_actual_date}, 收盘价 {stock_close}")
+        #
+        #else:
+        #    # 结果为 None 时触发，防止第 54 行报错中断整个脚本
+        #    print(f"⚠️ 无法为 {target_stock} 获取有效的交易日指标数据，已安全跳过该股票。")
+        #    # 如果是在 for 循环中，这里可以使用 continue 跳过本次循环
+        
         stock_metrics_actual_date = stock_metrics_result["Actual_Date"]
         stock_metrics_close_p = stock_metrics_result["Close"]
         stock_metrics_high_p = stock_metrics_result["High"]
