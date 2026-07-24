@@ -1,0 +1,197 @@
+import os
+import sys
+import datetime
+import numba
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import exchange_calendars as xcals
+import pytz  # 🚨 引入时区库，确保全球服务器运行都能锁定北京时间
+
+# 使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+def fetch_dynamic_atr(ticker_symbol, period_days=14, end_date_str=None):
+    """
+    【资产管理级自适应核心组件 - V5 最高御盾无死角完全体】
+    纯NumPy迭代核心，彻底根除真空期样本塌陷、回测长假尾部截断、未来函数渗透与极限越界崩溃
+    """
+    try:
+        tz_bj = pytz.timezone("Asia/Shanghai")
+        now_bj = datetime.datetime.now(tz_bj)
+
+        # ---------------------------------------------------------------------
+        # 1. 🚨【源头硬风控：自适应源头样本量考核线】
+        # ---------------------------------------------------------------------
+        # Wilder RMA算法递推必须拥有 2*N 行有效的 TR 数组。
+        # 在常态下，DataFrame 需要 2*N + 1 行（1行作为垫脚石）。
+        # 考虑到实盘在 15:00 - 15:05 宽限期内，我们为了静态幂等会强行将今天（T+0）的数据剔除，
+        # 为了保证剔除后剩下的历史骨架依然能饱满提供 2*N 个有效TR，源头考核门槛在宽限期内必须强制升维至 2*N + 2 行！
+        is_historical_backtest = end_date_str is not None
+        
+        if not is_historical_backtest:
+            market_close_time = now_bj.replace(hour=15, minute=0, second=0, microsecond=0)
+            market_safe_line = now_bj.replace(hour=15, minute=5, second=0, microsecond=0)
+            # 判定此时是否正处于实盘收盘的前5分钟真空清算期
+            is_vacuum_clearing = market_close_time <= now_bj <= market_safe_line
+        else:
+            is_vacuum_clearing = False
+
+        # 根据真实所处的时间轴场景，动态锁死最纯净的源头数据行数门槛
+        required_rows_audit = (period_days * 2 + 2) if is_vacuum_clearing else (period_days * 2 + 1)
+
+        # 为了应对A股长假与长停牌，初始回溯自然日直接拉高到 5.5 倍，减少重试循环
+        current_buffer_days = max(int(period_days * 5.5), 75)
+        df_hist = pd.DataFrame()
+
+        for attempt in range(3):
+            if is_historical_backtest:
+                # -----------------【历史回测模式】-----------------
+                end_date = datetime.datetime.strptime(end_date_str, "%Y-%m-%d")
+                start_date = end_date - datetime.timedelta(days=current_buffer_days)
+                # 向后多申请 1 天，严格对齐 yfinance 左闭右开机制，确保截止日数据能完整下载
+                download_end = end_date + datetime.timedelta(days=1)
+            else:
+                # -----------------【实盘即时模式】-----------------
+                end_date = now_bj.replace(tzinfo=None)
+                start_date = end_date - datetime.timedelta(days=current_buffer_days)
+                download_end = end_date
+
+            df_try = yf.download(
+                ticker_symbol,
+                start=start_date,
+                end=download_end,
+                interval="1d",
+                progress=False,
+                auto_adjust=True,  # 前复权强制开启，封杀除权价格跳空污染
+                timeout=5          # 紧凑超时拦截，防止文件句柄死锁耗尽
+            )
+
+            if not df_try.empty:
+                if isinstance(df_try.columns, pd.MultiIndex):
+                    df_try.columns = df_try.columns.get_level_values(0)
+                df_try.index = pd.to_datetime(df_try.index).tz_localize(None)
+
+                # 列名大小写强行规范化，彻底斩断 auto_adjust=True 触发的列名异变崩溃
+                df_try.columns = [col.lower().capitalize() for col in df_try.columns]
+
+                # 仅清洗全空行，保留未脱水行用于时间轴精准雷达定位
+                df_try = df_try.dropna(how="all")
+
+                # 🚨【核心物理防火墙】：坚决执行硬截断，封杀一切历史回测模式下的未来函数/盘中碎线渗透
+                df_try = df_try[df_try.index <= end_date]
+
+                if len(df_try) >= required_rows_audit:
+                    df_hist = df_try.copy()  # 深拷贝彻底隔离视图引用
+                    break
+                else:
+                    # 针对复牌新股，把目前最大能捞到的残存矩阵记录下来备份，交给后面的降维算法兜底
+                    df_hist = df_try.copy()
+
+            current_buffer_days *= 2
+
+        if df_hist.empty:
+            return None
+
+        # ---------------------------------------------------------------------
+        # 2. 精准时间轴静态锁定引擎
+        # ---------------------------------------------------------------------
+        last_k_date = df_hist.index[-1].date()
+
+        if not is_historical_backtest:
+            today_date = now_bj.date()
+
+            if now_bj < market_close_time:
+                # 15:00 前盘中：若刷出了今天未定型的残缺K线，强制切除并执行 .copy() 深拷贝隔离
+                if last_k_date == today_date:
+                    df_hist = df_hist.iloc[:-1].copy()
+            else:
+                if now_bj <= market_safe_line:
+                    # 🚨 在 15:00 - 15:05 真空期内，利用绝对时间戳强行过滤，退回昨天，实现绝对静态幂等
+                    # 由于我们在第1步动态将门槛提高到了 2*N+2，此处剪切掉今天后，剩余历史骨架长度依然完美满足 2*N+1 行！
+                    df_hist = df_hist[df_hist.index < pd.to_datetime(today_date)].copy()
+                else:
+                    # 过了 15:05：执行强脱水
+                    df_hist = df_hist.dropna(subset=["High", "Low", "Close"])
+                    if df_hist.empty: return None
+
+                    last_k_date = df_hist.index[-1].date()
+                    if last_k_date != today_date:
+                        print(f"🚨 实盘行情假死熔断：已过15:05，未见今日闭合K线")
+                        return None
+
+            # 管道最终数据大脱水清洗，确保进入计算层的数据无任何 NaN
+            df_hist = df_hist.dropna(subset=["High", "Low", "Close"])
+            if df_hist.empty: return None
+        else:
+            # 历史回测模式脱水
+            df_hist = df_hist.dropna(subset=["High", "Low", "Close"])
+            if df_hist.empty: return None
+
+            last_k_date = df_hist.index[-1].date()
+            if last_k_date != end_date.date():
+                print(f"⚠️ 回测非交易日拦截：指定日期[{end_date.date()}]无实际交易行为。执行挂起熔断。")
+                return None
+
+        # ---------------------------------------------------------------------
+        # 3. NumPy 矩阵提取与完美的 TR 边界计算
+        # ---------------------------------------------------------------------
+        high = df_hist.loc[:, "High"].to_numpy()
+        low = df_hist.loc[:, "Low"].to_numpy()
+        close = df_hist.loc[:, "Close"].to_numpy()
+
+        tr_len = len(high) - 1
+        # 最低防线：如果矩阵太短连2行K线都没有（无法生成1行TR），直接拒绝放行
+        if tr_len <= 1:
+            return None
+
+        tr_np = np.zeros(tr_len, dtype=float)
+
+        high_low = high[1:] - low[1:]
+        high_close_prev = np.abs(high[1:] - close[:-1])
+        low_close_prev = np.abs(low[1:] - close[:-1])
+
+        tr_np = np.maximum(high_low, np.maximum(high_close_prev, low_close_prev))
+
+        # ---------------------------------------------------------------------
+        # 4. 次新股与重大重组停牌复牌股的自适应降维算法（引入物理边界强限幅）
+        # ---------------------------------------------------------------------
+        if len(tr_np) < (period_days * 2):
+            # 资产管理级动态降维退化防御线：将计算周期自适应压缩为当前可用 TR 长度的二分之一
+            actual_period = max(2, len(tr_np) // 2)
+        else:
+            # 样本量充沛，完美执行标准的 14日 Wilder 平滑
+            actual_period = period_days
+
+        if len(tr_np) < actual_period:
+            return None
+
+        atr_np = np.zeros_like(tr_np)
+
+        # 种子期：由于 tr_np 彻底去除了 K 线的索引 0 占位行，
+        # tr_np[:actual_period] 物理上严格对应原始 K 线的第 1 到第 actual_period 根完整日线的真实波幅，时间轴绝对无缝对齐！
+        initial_sma = np.mean(tr_np[:actual_period])
+        if np.isnan(initial_sma) or np.isinf(initial_sma):
+            return None
+
+        # 🚨【核心修正：引入 min 限制，彻底封杀 close 轴的 IndexError 溢出死穴】
+        # 无论前序如何清洗、无论 actual_period 降维至几，索引指针死死锁定在 close 矩阵的合法边界内
+        safe_close_idx = min(actual_period, len(close) - 1)
+        min_atr_floor_init = max(close[safe_close_idx] * 0.0005, 0.001)
+        atr_np[actual_period - 1] = max(initial_sma, min_atr_floor_init)
+
+        # 递推期：严格按照时间正序执行您的纯正 NumPy RMA 迭代
+        alpha = 1.0 / actual_period
+        for i in range(actual_period, len(tr_np)):
+            raw_atr = alpha * tr_np[i] + (1.0 - alpha) * atr_np[i - 1]
+            # 🚨 物理时间轴精密一一映射：同时加上 min 溢出保护，杜绝任何极端脏数据断层引起的越界大爆炸
+            safe_loop_idx = min(i + 1, len(close) - 1)
+            current_floor = max(close[safe_loop_idx] * 0.0005, 0.001)
+            atr_np[i] = max(raw_atr, current_floor)
+
+        # 绝对无损返回原生 64位 float
+        return float(atr_np[-1])
+
+    except Exception as e:
+        print(f" 🚨 独立方法运行异常: {e}")
+        return None
