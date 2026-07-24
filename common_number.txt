@@ -1,0 +1,34 @@
+import os
+import sys
+import datetime
+import numba
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import exchange_calendars as xcals
+import pytz  # 🚨 引入时区库，确保全球服务器运行都能锁定北京时间
+from enum import Enum
+from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, ROUND_DOWN
+
+# 使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+class RoundingStyle(Enum):
+    """通用金融舍入定数枚举 (纯数学工具，不绑定任何业务指标)"""
+    
+    ROUND = ROUND_HALF_UP  # 完美的四舍五入
+    CEIL  = ROUND_CEILING  # 完美的直接进位（直接升）
+    FLOOR = ROUND_DOWN     # 完美的直接舍去（直接砍）
+
+    def apply(self, value: float | str | int, decimals: int = 2) -> float:
+        """执行当前定数对应的舍入规则，默认保留 2 位小数"""
+        if value is None:
+            return 0.0
+            
+        dec_val = Decimal(str(value))
+        # 动态构造保留位数模板，例如 2 位就是 '0.01'，4 位就是 '0.0001'
+        places_template = Decimal('1').scaleb(-decimals)
+        
+        # self.value 拿到的就是对应的 ROUND_HALF_UP / ROUND_CEILING / ROUND_DOWN
+        return float(dec_val.quantize(places_template, rounding=self.value))
