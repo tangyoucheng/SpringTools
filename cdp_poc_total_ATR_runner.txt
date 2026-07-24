@@ -14,7 +14,10 @@ from CDP_poc_config import stock_dict, OUTPUT_END_DATE
 from export_cdp_to_excel import export_cdp_to_excel
 
 # 导入上面写好的核心逻辑组件
-from cdp_poc_total_ATR import execute_all_period_pipeline, get_stock_metrics_by_calendar
+from cdp_poc_total_ATR import execute_all_period_pipeline
+
+from common_atr import fetch_dynamic_atr
+from common_Actual_Date_info import get_stock_metrics_by_calendar
 
 if __name__ == "__main__":
     # =========================================================================
@@ -90,6 +93,35 @@ if __name__ == "__main__":
             target_end_dt = now_clock
             start_date_past = target_end_dt - datetime.timedelta(days=400)
             download_end_dt = target_end_dt
+        
+        
+        
+        ##########
+        print("=" * 75)
+        print(f"【抢反弹的时候才用的信息，不是抢反弹的场合不用。---开始】")
+        base_atr = fetch_dynamic_atr(target_stock, period_days=5, end_date_str=CHOSEN_END_DATE)
+        
+        # 固定基准测试参数（以概伦电子昨日数据为原型模拟）
+        YESTERDAY_CLOSE = stock_metrics_close_p
+        YESTERDAY_ATR_5D = base_atr # 假设ATR 1.85 
+        BETA_PARAM = 0.382  # 右侧反弹标准：0.382 * 4.4178 = 1.688 元
+        POC_1D_NL = 32.75
+
+        # 对应您昨日看板数据：1天NL(低吸支撑)=32.75，1天AL(止损边界)=31.47
+        print(
+            f"【系统配置】昨收: {stock_metrics_close_p:.2f} 元 | 5日ATR: {YESTERDAY_ATR_5D:.4f} 元"
+            #f"【系统配置】昨收: {YESTERDAY_CLOSE} 元 | 5日垂直暴跌ATR: {round(YESTERDAY_ATR_5D,4)} 元"
+        )
+        print(
+            f"【战略卡尺】日内恐慌激活线: <= {(YESTERDAY_CLOSE-YESTERDAY_ATR_5D):.2f}元(估算值:锁定日的收盘价-5天的ATR)"
+            "\n" + f"            日内恐慌激活线一定要和下面的各个周期的边界值对照后，再做具体划定"
+        )
+        print(f"【动量卡尺】右侧反弹硬触发阈值(ATR_5D*0.382): >= {(BETA_PARAM * YESTERDAY_ATR_5D):.2f} 元")
+        print(f"【抢反弹的时候才用的信息，不是抢反弹的场合不用。---结束】")
+        print("=" * 75)
+        ##########
+        
+        
         
         # 2. 抓取多日大周期历史日线数据
         print(f"📡 正在调取 【{target_stock} {stock_name}】 交易所底仓K线流数据...")
