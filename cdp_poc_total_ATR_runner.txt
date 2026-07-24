@@ -18,7 +18,9 @@ from cdp_poc_total_ATR import execute_all_period_pipeline
 
 from common_atr import fetch_dynamic_atr
 from common_Actual_Date_info import get_stock_metrics_by_calendar
+from common_number import RoundingStyle
 
+        
 if __name__ == "__main__":
     # =========================================================================
     # 🚨 【测试控制台核心变量配置区】
@@ -109,7 +111,7 @@ if __name__ == "__main__":
 
         # 对应您昨日看板数据：1天NL(低吸支撑)=32.75，1天AL(止损边界)=31.47
         print(
-            f"【系统配置】昨收: {stock_metrics_close_p:.2f} 元 | 5日ATR: {YESTERDAY_ATR_5D:.4f} 元"
+            f"【系统配置】锁定日收盘价: {stock_metrics_close_p:.2f} 元 | 5日ATR: {YESTERDAY_ATR_5D:.4f} 元"
             #f"【系统配置】昨收: {YESTERDAY_CLOSE} 元 | 5日垂直暴跌ATR: {round(YESTERDAY_ATR_5D,4)} 元"
         )
         print(
@@ -195,7 +197,21 @@ if __name__ == "__main__":
             f"【{target_stock} {stock_name}】 " + 
             f" 盘中当前最新价 : {stock_metrics_close_p:.2f} 元  (最高: {stock_metrics_high_p:.2f} | 最低: {stock_metrics_low_p:.2f})"
         )
-        export_cdp_to_excel(periods_pool,results_board,target_stock,stock_name,stock_metrics_close_p,stock_metrics_high_p,stock_metrics_low_p,CHOSEN_END_DATE)        
+        
+        # === 定义股票对象 ===
+        stock_info = {
+            "股票代码": target_stock,
+            "股票名称": stock_name,
+            "收盘价": RoundingStyle.ROUND.apply(stock_metrics_close_p),
+            "最高价": RoundingStyle.ROUND.apply(stock_metrics_high_p),
+            "最低价": RoundingStyle.ROUND.apply(stock_metrics_low_p),
+            "5日ATR": RoundingStyle.ROUND.apply(YESTERDAY_ATR_5D),
+            "日内恐慌激活线": RoundingStyle.ROUND.apply(stock_metrics_close_p - YESTERDAY_ATR_5D),
+            "反弹触发阈值": RoundingStyle.ROUND.apply(0.382 * YESTERDAY_ATR_5D),
+        }
+        # 写入到excel
+        export_cdp_to_excel(periods_pool,results_board,stock_info,CHOSEN_END_DATE)    
+        
         # 1. 定义统一的表头（直接写文字，无需任何宽度指定）
         headers = [
             "周期类型",
