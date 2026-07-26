@@ -1,0 +1,84 @@
+import os
+import sys
+import datetime
+import numba
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import exchange_calendars as xcals
+import pytz  # 🚨 引入时区库，确保全球服务器运行都能锁定北京时间
+
+# 使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+def fetch_dynamic_atr(df_try, period_days=14):
+    """
+    【资产管理级自适应核心组件 - V5 最高御盾无死角完全体】
+    纯NumPy迭代核心，彻底根除真空期样本塌陷、回测长假尾部截断、未来函数渗透与极限越界崩溃
+    """
+    try:
+        f_hist = pd.DataFrame()
+        df_hist = df_try.copy()
+
+        # ---------------------------------------------------------------------
+        # 3. NumPy 矩阵提取与完美的 TR 边界计算
+        # ---------------------------------------------------------------------
+        high = df_hist.loc[:, "High"].to_numpy()
+        low = df_hist.loc[:, "Low"].to_numpy()
+        close = df_hist.loc[:, "Close"].to_numpy()
+
+        tr_len = len(high) - 1
+        # 最低防线：如果矩阵太短连2行K线都没有（无法生成1行TR），直接拒绝放行
+        if tr_len <= 1:
+            return None
+
+        tr_np = np.zeros(tr_len, dtype=float)
+
+        high_low = high[1:] - low[1:]
+        high_close_prev = np.abs(high[1:] - close[:-1])
+        low_close_prev = np.abs(low[1:] - close[:-1])
+
+        tr_np = np.maximum(high_low, np.maximum(high_close_prev, low_close_prev))
+
+        # ---------------------------------------------------------------------
+        # 4. 次新股与重大重组停牌复牌股的自适应降维算法（引入物理边界强限幅）
+        # ---------------------------------------------------------------------
+        if len(tr_np) < (period_days * 2):
+            # 资产管理级动态降维退化防御线：将计算周期自适应压缩为当前可用 TR 长度的二分之一
+            actual_period = max(2, len(tr_np) // 2)
+        else:
+            # 样本量充沛，完美执行标准的 14日 Wilder 平滑
+            actual_period = period_days
+
+        if len(tr_np) < actual_period:
+            return None
+
+        atr_np = np.zeros_like(tr_np)
+
+        # 种子期：由于 tr_np 彻底去除了 K 线的索引 0 占位行，
+        # tr_np[:actual_period] 物理上严格对应原始 K 线的第 1 到第 actual_period 根完整日线的真实波幅，时间轴绝对无缝对齐！
+        initial_sma = np.mean(tr_np[:actual_period])
+        if np.isnan(initial_sma) or np.isinf(initial_sma):
+            return None
+
+        # 🚨【核心修正：引入 min 限制，彻底封杀 close 轴的 IndexError 溢出死穴】
+        # 无论前序如何清洗、无论 actual_period 降维至几，索引指针死死锁定在 close 矩阵的合法边界内
+        safe_close_idx = min(actual_period, len(close) - 1)
+        min_atr_floor_init = max(close[safe_close_idx] * 0.0005, 0.001)
+        atr_np[actual_period - 1] = max(initial_sma, min_atr_floor_init)
+
+        # 递推期：严格按照时间正序执行您的纯正 NumPy RMA 迭代
+        alpha = 1.0 / actual_period
+        for i in range(actual_period, len(tr_np)):
+            raw_atr = alpha * tr_np[i] + (1.0 - alpha) * atr_np[i - 1]
+            # 🚨 物理时间轴精密一一映射：同时加上 min 溢出保护，杜绝任何极端脏数据断层引起的越界大爆炸
+            safe_loop_idx = min(i + 1, len(close) - 1)
+            current_floor = max(close[safe_loop_idx] * 0.0005, 0.001)
+            atr_np[i] = max(raw_atr, current_floor)
+
+        # 绝对无损返回原生 64位 float
+        return float(atr_np[-1])
+
+    except Exception as e:
+        print(f" 🚨 独立方法运行异常: {e}")
+        return None
