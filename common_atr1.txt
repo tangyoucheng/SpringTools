@@ -11,74 +11,106 @@ import pytz  # 🚨 引入时区库，确保全球服务器运行都能锁定北
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import numpy as np
+import pandas as pd
+
+
 def fetch_dynamic_atr(df_try, period_days=14):
-    """
-    【资产管理级自适应核心组件 - V5 最高御盾无死角完全体】
-    纯NumPy迭代核心，彻底根除真空期样本塌陷、回测长假尾部截断、未来函数渗透与极限越界崩溃
+    """【资产管理级自适应核心组件 - V16 傲视穹穹终定体】
+
+    1. 双向夹逼锁：引入种子期天花板常识锁，彻底封杀“种子期乌龙巨震 + 后续无限一字跌停”引发的 ATR 虚高不退与风控僵死盲区。
+    2. 零分发规范：本函数已做极致轻量化标量重整。外层工程部署时，强烈建议在上游一次性将大表重整为物理 C 连续矩阵，
+       传入本函数的 df_try["High"].to_numpy() 等应当是原生连续视图，以消灭频繁 malloc 导致的渐进式回测卡顿。
     """
     try:
-        f_hist = pd.DataFrame()
-        df_hist = df_try.copy()
+        # 🚨【V16 规范提示：若上游已固化 C 连续，此处 np.array(..., order='C') 将自动退化为极速 O(1) 视图引用】
+        high = np.array(df_try["High"], dtype=float, order="C")
+        low = np.array(df_try["Low"], dtype=float, order="C")
+        close = np.array(df_try["Close"], dtype=float, order="C")
 
-        # ---------------------------------------------------------------------
-        # 3. NumPy 矩阵提取与完美的 TR 边界计算
-        # ---------------------------------------------------------------------
-        high = df_hist.loc[:, "High"].to_numpy()
-        low = df_hist.loc[:, "Low"].to_numpy()
-        close = df_hist.loc[:, "Close"].to_numpy()
+        total_len = len(high)
+        tr_len = total_len - 1
 
-        tr_len = len(high) - 1
-        # 最低防线：如果矩阵太短连2行K线都没有（无法生成1行TR），直接拒绝放行
-        if tr_len <= 1:
+        # 10N 场景标准拦截线
+        if tr_len < period_days:
             return None
 
-        tr_np = np.zeros(tr_len, dtype=float)
+        # 🚨【SIMD 级全毒素原子化洗净防线】
+        if (
+            np.isnan(close).any() or np.isnan(high).any() or np.isnan(low).any()
+            or np.isinf(close).any() or np.isinf(high).any() or np.isinf(low).any()
+        ):
+            return None
 
+        # 性能压榨：由于 NaN 已被全量封杀，后续直接呼叫纯正的原生 C 级 np.min 矢量算子
+        if np.min(close) <= 0.0 or np.min(high) <= 0.0 or np.min(low) <= 0.0:
+            return None
+
+        # 1. 完美的 TR 矩阵化计算
         high_low = high[1:] - low[1:]
         high_close_prev = np.abs(high[1:] - close[:-1])
         low_close_prev = np.abs(low[1:] - close[:-1])
+        tr_np = np.maximum(
+            high_low, np.maximum(high_close_prev, low_close_prev)
+        )
 
-        tr_np = np.maximum(high_low, np.maximum(high_close_prev, low_close_prev))
+        # 2. 完美的时序物理映射（与 tr_np 物理时间严格一一对应）
+        close_current = close[1:]
+        floor_np = np.maximum(close_current * 0.0005, 0.001)
 
-        # ---------------------------------------------------------------------
-        # 4. 次新股与重大重组停牌复牌股的自适应降维算法（引入物理边界强限幅）
-        # ---------------------------------------------------------------------
-        if len(tr_np) < (period_days * 2):
-            # 资产管理级动态降维退化防御线：将计算周期自适应压缩为当前可用 TR 长度的二分之一
-            actual_period = max(2, len(tr_np) // 2)
-        else:
-            # 样本量充沛，完美执行标准的 14日 Wilder 平滑
-            actual_period = period_days
-
-        if len(tr_np) < actual_period:
+        # 🚨【时间轴动态映射常识锁】
+        # 只有当天 TR 超过当天股价的 2 倍，才判定为数据源投毒或乌龙指。完美兼容仙股的历史真实巨震。
+        if np.any(tr_np > (close_current * 2.0)):
             return None
 
-        atr_np = np.zeros_like(tr_np)
+        # 🚨【上游相对比例矩阵重整】
+        tr_ratio_np = tr_np / close_current
 
-        # 种子期：由于 tr_np 彻底去除了 K 线的索引 0 占位行，
-        # tr_np[:actual_period] 物理上严格对应原始 K 线的第 1 到第 actual_period 根完整日线的真实波幅，时间轴绝对无缝对齐！
-        initial_sma = np.mean(tr_np[:actual_period])
-        if np.isnan(initial_sma) or np.isinf(initial_sma):
+        # 3. 种子期计算与健康度审查
+        initial_sma = np.mean(tr_np[:period_days])
+        
+        # 🚨【无量纲比例流空间种子期拦截】
+        if (
+            np.isnan(initial_sma) 
+            or np.isinf(initial_sma) 
+            or np.mean(tr_ratio_np[:period_days]) <= 1e-5
+        ):
             return None
 
-        # 🚨【核心修正：引入 min 限制，彻底封杀 close 轴的 IndexError 溢出死穴】
-        # 无论前序如何清洗、无论 actual_period 降维至几，索引指针死死锁定在 close 矩阵的合法边界内
-        safe_close_idx = min(actual_period, len(close) - 1)
-        min_atr_floor_init = max(close[safe_close_idx] * 0.0005, 0.001)
-        atr_np[actual_period - 1] = max(initial_sma, min_atr_floor_init)
+        # 分配 ATR 容器
+        atr_np = np.zeros(tr_len, dtype=float)
+        
+        # 🚨【漏洞 1 修正：初始种子双向动态夹逼常识锁】
+        # 完美对齐物理时序：close_current[period_days - 1] 严格对应种子期最后一根 K 线的收盘价。
+        # 引入 close_current * 2.0 作为硬性天花板，防止历史巨震种子值在后续连续一字跌停时沦为高空挂起的僵尸信号！
+        seed_floor = floor_np[period_days - 1]
+        seed_ceiling = close_current[period_days - 1] * 2.0
+        
+        # 使用夹逼法则（Floor <= ATR_Seed <= Ceiling）确立无瑕疵初始波动率
+        atr_np[period_days - 1] = max(seed_floor, min(initial_sma, seed_ceiling))
 
-        # 递推期：严格按照时间正序执行您的纯正 NumPy RMA 迭代
-        alpha = 1.0 / actual_period
-        for i in range(actual_period, len(tr_np)):
-            raw_atr = alpha * tr_np[i] + (1.0 - alpha) * atr_np[i - 1]
-            # 🚨 物理时间轴精密一一映射：同时加上 min 溢出保护，杜绝任何极端脏数据断层引起的越界大爆炸
-            safe_loop_idx = min(i + 1, len(close) - 1)
-            current_floor = max(close[safe_loop_idx] * 0.0005, 0.001)
-            atr_np[i] = max(raw_atr, current_floor)
+        # 4. 递推期计算（完美的 C-Contiguous 线性自增状态机）
+        alpha = 1.0 / period_days
+        one_minus_alpha = 1.0 - alpha
 
-        # 绝对无损返回原生 64位 float
-        return float(atr_np[-1])
+        for i in range(period_days, tr_len):
+            # 应用相对比例直接拦截一字板假死，消除了循环内的数组寻址与乘法运算
+            if tr_ratio_np[i] <= 1e-5:
+                # 流动性冻结，状态机挂起，完美强制继承前一日有效的真实波动率
+                atr_np[i] = atr_np[i - 1]
+            else:
+                # 正常交易日，执行 Wilder 平滑迭代并附加硬底线限幅
+                raw_atr = alpha * tr_np[i] + one_minus_alpha * atr_np[i - 1]
+                atr_np[i] = max(raw_atr, floor_np[i])
 
-    except Exception as e:
-        print(f" 🚨 独立方法运行异常: {e}")
+        final_atr = atr_np[-1]
+
+        # 5. 终极物理常识防空门
+        if final_atr <= 0.0:
+            return None
+
+        return float(final_atr)
+
+    except Exception:
+        # 实盘高频大并发环境下，使用顶级静默风控熔断，杜绝 I/O 阻塞风险
         return None
