@@ -1,0 +1,275 @@
+import os
+import sys
+import datetime
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from tabulate import tabulate
+
+
+# 使用免安装版本时，为了读取CDP_config.py，添加的设定
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 假设 stock_dict 从配置中导入，若本地测试可自行定义
+from CDP_poc_config import stock_dict, OUTPUT_END_DATE,CURRENT_ATR_5
+from export_cdp_to_excel import export_cdp_to_excel
+
+# 导入上面写好的核心逻辑组件
+from cdp_poc_total_ATR import execute_all_period_pipeline
+
+from common_atr import fetch_dynamic_atr
+from common_Actual_Date_info import get_stock_metrics_by_calendar
+from common_number import RoundingStyle
+
+        
+if __name__ == "__main__":
+    # =========================================================================
+    # 🚨 【测试控制台核心变量配置区】
+    # =========================================================================
+    #target_stock = "688037.SS"  # 监控标的：芯源微
+    stock_codes = list(stock_dict.keys())
+    for stock_code in stock_codes:
+        # 转换为字符串，防止原数据是数字类型
+        stock_code = str(stock_code)
+        
+        # 判断是否已经带了后缀，如果没有，则根据规则拼接
+        if not (stock_code.endswith('.SS') or stock_code.endswith('.SZ')):
+            # 科创板(688..)和沪市主板(60..)拼接 .SS，其余（如创业板300..）拼接 .SZ
+            if stock_code.startswith(('688', '60')):
+                target_stock = f"{stock_code}.SS"
+            else:
+                target_stock = f"{stock_code}.SZ"
+        else:
+            target_stock = stock_code
+
+        stock_name = stock_dict.get(
+            stock_code,
+            "未知股票"
+        )  
+    
+        # 🤖 核心新增功能测试：在此指定你想截至的历史具体日期 (格式必须为 "YYYY-MM-DD")
+        # 如果您想偶尔直接看今天最新的收盘价，请无条件将其【置为 None】(例如: CHOSEN_END_DATE = None)
+        #CHOSEN_END_DATE = None  
+        #CHOSEN_END_DATE = "2026-07-21"    
+        CHOSEN_END_DATE = OUTPUT_END_DATE   
+
+        if CHOSEN_END_DATE is None:
+            CHOSEN_END_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        #print(f"正在查询股票 {target_stock} 在今天 ({CHOSEN_END_DATE}) 或最近交易日的数据...")
+        stock_metrics_result = get_stock_metrics_by_calendar(target_stock, CHOSEN_END_DATE)
+        # ─── 安全检查：只有当结果不为 None 时才提取数据 ───
+        #if stock_metrics_result is not None:
+        #    # 这里是原本第 54 行的代码，现在安全了
+        #    stock_metrics_actual_date = stock_metrics_result["Actual_Date"]
+        #    stock_close = stock_metrics_result["Close"]
+        #    
+        #    # ... 在这里继续编写您后续的 ATR 或 CDP 计算逻辑 ...
+        #    print(f"成功获取数据：实际交易日 {stock_metrics_actual_date}, 收盘价 {stock_close}")
+        #
+        #else:
+        #    # 结果为 None 时触发，防止第 54 行报错中断整个脚本
+        #    print(f"⚠️ 无法为 {target_stock} 获取有效的交易日指标数据，已安全跳过该股票。")
+        #    # 如果是在 for 循环中，这里可以使用 continue 跳过本次循环
+        
+        stock_metrics_actual_date = stock_metrics_result["Actual_Date"]
+        stock_metrics_close_p = stock_metrics_result["Close"]
+        stock_metrics_high_p = stock_metrics_result["High"]
+        stock_metrics_low_p = stock_metrics_result["Low"]        
+        
+        CHOSEN_END_DATE = stock_metrics_actual_date       
+        
+        print(f"🏁 全周期 ATR 自适应量化引擎已启动...")
+        if CHOSEN_END_DATE is not None:
+            print(f"📡 当前模式：指定历史复盘回测模式 | 精准截至日期锁死为: {CHOSEN_END_DATE}")
+        else:
+            print(f"📡 当前模式：盘中最新系统时钟模式 | 数据截止点: 伴随当天收盘线动态对齐")
+
+        # 1. 动态生成数据下载的时空切片边界
+        now_clock = datetime.datetime.now()
+        if CHOSEN_END_DATE is not None:
+            target_end_dt = datetime.datetime.strptime(CHOSEN_END_DATE, "%Y-%m-%d")
+            start_date_past = target_end_dt - datetime.timedelta(days=400)
+            # yfinance下载终点不包当天，所以推后1天
+            download_end_dt = target_end_dt + datetime.timedelta(days=1)
+        else:
+            target_end_dt = now_clock
+            start_date_past = target_end_dt - datetime.timedelta(days=400)
+            download_end_dt = target_end_dt
+        
+        
+
+        
+        
+        
+        # 2. 抓取多日大周期历史日线数据
+        print(f"📡 正在调取 【{target_stock} {stock_name}】 交易所底仓K线流数据...")
+        df_daily_raw = yf.download(target_stock, start=start_date_past, end=download_end_dt, interval="1d", progress=False, auto_adjust=True, group_by='ticker')
+        
+        if df_daily_raw.empty:
+            print(f"🚨 错误：未能获取到历史日K线数据，请检查网络或更换标的代码！")
+            sys.exit(0)
+        
+        # 强力剥离多重索引列外壳，绝杀一切维度过载报错
+        if isinstance(df_daily_raw.columns, pd.MultiIndex):
+            df_daily_raw.columns = df_daily_raw.columns.get_level_values(-1)
+        
+        ##########
+        print("=" * 75)
+        print(f"【抢反弹的时候才用的信息，不是抢反弹的场合不用。---开始】")
+        base_atr = fetch_dynamic_atr(df_daily_raw.tail(10*5), period_days=5)
+        #base_atr = CURRENT_ATR_5
+        
+        # 固定基准测试参数（以概伦电子昨日数据为原型模拟）
+        YESTERDAY_CLOSE = stock_metrics_close_p
+        YESTERDAY_ATR_5D = base_atr # 假设ATR 1.85 
+        BETA_PARAM = 0.382  # 右侧反弹标准：0.382 * 4.4178 = 1.688 元
+        POC_1D_NL = 32.75
+
+        # 对应您昨日看板数据：1天NL(低吸支撑)=32.75，1天AL(止损边界)=31.47
+        print(
+            f"【系统配置】锁定日收盘价: {stock_metrics_close_p:.2f} 元 | 5日ATR: {YESTERDAY_ATR_5D:.4f} 元"
+            #f"【系统配置】昨收: {YESTERDAY_CLOSE} 元 | 5日垂直暴跌ATR: {round(YESTERDAY_ATR_5D,4)} 元"
+        )
+        print(
+            f"【战略卡尺】日内恐慌激活线: <= {(YESTERDAY_CLOSE-YESTERDAY_ATR_5D):.2f}元(估算值:锁定日的收盘价-5天的ATR)"
+            "\n" + f"            日内恐慌激活线一定要和下面的各个周期的边界值对照后，再做具体划定"
+        )
+        print(f"【动量卡尺】右侧反弹硬触发阈值(ATR_5D*0.382): >= {(BETA_PARAM * YESTERDAY_ATR_5D):.2f} 元")
+        print(f"【抢反弹的时候才用的信息，不是抢反弹的场合不用。---结束】")
+        print("=" * 75)
+        ##########
+        
+        # 格式化日期，生成算法循环所需的时间衰减池 date_str 列
+        df_daily_raw['date_str'] = df_daily_raw.index.strftime("%Y-%m-%d")
+
+        # 3. 抓取当日高频分时数据
+        if CHOSEN_END_DATE is not None:
+            # 复盘历史时，抓取指定日当天的 1分钟 极细分时图进行完全还原
+            df_intraday_raw = yf.download(target_stock, start=CHOSEN_END_DATE, end=download_end_dt, interval="1m", progress=False)
+        else:
+            # 实时最新情况，下载当前最新一天的 1分钟 分时
+            df_intraday_raw = yf.download(target_stock, period="1d", interval="1m", progress=False)
+        
+        if isinstance(df_intraday_raw.columns, pd.MultiIndex):
+            df_intraday_raw.columns = df_intraday_raw.columns.get_level_values(0)
+        
+        # 【安全防御网】万一 yfinance 因为历史久远查不到当天的 1M 分时图，自动执行单日降维模拟，防引擎崩溃
+        if df_intraday_raw.empty:
+            print(f"🚨 提示：该截止日期分时图已过期，系统自动触发降维保护，切片日线最后一日数据充当虚拟分时流")
+            last_row = df_daily_raw.iloc[-1]
+            last_close_val = float(np.array(last_row['Close']).flatten()[0])
+            minutes_sim = 240
+            sim_closes = last_close_val + np.cumsum(np.random.normal(0, 0.5, minutes_sim))
+            sim_closes[100:105] = last_close_val * 0.85
+            df_intraday_raw = pd.DataFrame({
+                "Close": sim_closes, "High": sim_closes + 0.2, "Low": sim_closes - 0.2,
+                "Volume": np.random.randint(1000, 5000, minutes_sim)
+            })
+
+        # 提取基准价格，彻底杜绝 Series/ravel 维度报错
+        fallback_base_price = float(np.array(df_daily_raw['Close'].iloc[-1]).flatten()[0])
+
+        # 4. 驱动多周期并发扫描核心大循环
+        periods_pool = [1, 3, 5, 20, 60, 120, 250]
+        results_board = {}
+        
+        base_atr_14 = fetch_dynamic_atr(df_daily_raw.tail(10*14), period_days=14)
+        print(
+            f"【系统配置】锁定日收盘价: {stock_metrics_close_p:.2f} 元 | 14日ATR: {base_atr_14:.4f} 元"
+        )
+        
+        for days in periods_pool:
+            if days == 1:
+                # 1天短线单日分时：传入对应分时表格，日期池传空，并实时透传用户指定的截止时间
+                results_board[days] = execute_all_period_pipeline(
+                    target_stock, df_intraday_raw, [], df_period_days=1, base_price=fallback_base_price, end_date_str=CHOSEN_END_DATE, base_atr=base_atr_14
+                )
+            else:
+                # 多日宏观大周期：截取对应天数的日K线切片传入
+                df_slice = df_daily_raw.iloc[-days:]
+                sub_dates_pool = df_slice["date_str"].tolist()
+                results_board[days] = execute_all_period_pipeline(
+                    target_stock, df_slice, sub_dates_pool, df_period_days=days, base_price=fallback_base_price, end_date_str=CHOSEN_END_DATE, base_atr=base_atr_14
+                )
+
+        # 5. 工业级多周期终判对齐战略总看板打印
+        print("\n" + "🛡️"*12 + " 全周期量化终判对齐审计复盘 " + "🛡️"*12)
+        for days in periods_pool:
+            print(f"【{days}天线周期审计日志】: {results_board[days]['audit_status']}")
+            
+        log_date_str = CHOSEN_END_DATE if CHOSEN_END_DATE is not None else now_clock.strftime('%Y-%m-%d')
+        print("\n" + "🏁" * 15 + f" 【{log_date_str}】全周期量化终判对齐战略总看板 " + "🏁" * 15)        
+            
+        print(
+            f"【{target_stock} {stock_name}】 " + 
+            f" 盘中当前最新价 : {stock_metrics_close_p:.2f} 元  (最高: {stock_metrics_high_p:.2f} | 最低: {stock_metrics_low_p:.2f})"
+        )
+        
+        # === 定义股票对象 ===
+        stock_info = {
+            "股票代码": target_stock,
+            "股票名称": stock_name,
+            "收盘价": RoundingStyle.ROUND.apply(stock_metrics_close_p),
+            "最高价": RoundingStyle.ROUND.apply(stock_metrics_high_p),
+            "最低价": RoundingStyle.ROUND.apply(stock_metrics_low_p),
+            "14日ATR": RoundingStyle.ROUND.apply(base_atr_14),
+            "5日ATR": RoundingStyle.ROUND.apply(YESTERDAY_ATR_5D),
+            "日内恐慌激活线": RoundingStyle.ROUND.apply(stock_metrics_close_p - YESTERDAY_ATR_5D),
+            "反弹触发阈值": RoundingStyle.ROUND.apply(0.382 * YESTERDAY_ATR_5D),
+        }
+        # 写入到excel
+        export_cdp_to_excel(periods_pool,results_board,stock_info,CHOSEN_END_DATE)    
+        
+        # 1. 定义统一的表头（直接写文字，无需任何宽度指定）
+        headers = [
+            "周期类型",
+            "智能审定真POC",
+            "中轴(CDP)",
+            "止损边界(AL)",
+            "低吸支撑(NL)",
+            "高抛阻力(NH)",
+            "追多边界(AH)",
+        ]
+
+        # 2. 循环遍历数据池，将每一行存入二维列表中
+        table_rows = []
+        for days in periods_pool:
+            res = results_board[days]
+            if days <= 5:
+                name_str = f"{days}天短线历史"
+            else:
+                name_str = (
+                    f"20日线(月度)"
+                    if days == 20
+                    else (
+                        f"60日线(季度)"
+                        if days == 60
+                        else (f"120日线(半年)" if days == 120 else f"250日线(年度)")
+                    )
+                )
+
+            # 提取并格式化数字（转为浮点数交给 tabulate，它能更智能地对齐小数点）
+            table_rows.append(
+                [
+                    name_str,
+                    float(res["final_poc"]),
+                    float(res["true_cdp"]),
+                    float(res["al_poc"]),
+                    float(res["nl_poc"]),
+                    float(res["nh_poc"]),
+                    float(res["ah_poc"]),
+                ]
+            )
+
+        # 3. 使用 tabulate 打印完美对齐的表格
+        # tablefmt="presto" 可以完美还原你原先的“管道符 | ”风格，同时表格线和列宽会自动对齐
+        print(
+            tabulate(
+                table_rows,
+                headers=headers,
+                tablefmt="presto",  # 紧凑管道符风格，如果想用全网格可以用 "grid"
+                numalign="right",  # 数字列自动靠右对齐（金融表格标准，小数点会垂直对齐）
+                stralign="left",  # 文本列（周期类型）靠左对齐
+                floatfmt=".2f",  # 全局控制所有数字保留2位小数
+            )
+        )
