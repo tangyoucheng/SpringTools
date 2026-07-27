@@ -9,7 +9,7 @@ import yfinance as yf
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 假设 stock_dict 从配置中导入，若本地测试可自行定义
-from CDP_poc_today_config import stocks_list
+from cdp_poc_today_ATR_config import stocks_list
 
 # =========================================================================
 # 【完美修复】当日分时自适应 14日ATR 直方图算法（引入开盘安全气囊与 OHLC 投射）
