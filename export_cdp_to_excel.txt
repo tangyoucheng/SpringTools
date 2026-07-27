@@ -1,6 +1,10 @@
+#export_cdp_to_excel.py
+
 import os
 import sys
 import pandas as pd
+from pathlib import Path
+from datetime import datetime
 from openpyxl import load_workbook
 from enum import Enum
 from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, ROUND_DOWN
@@ -126,8 +130,20 @@ def export_cdp_to_excel(
         for col_idx, value in enumerate(row, start=START_COL):
             ws.cell(row=row_offset, column=col_idx, value=value)
 
+
     # 生成动态文件名
-    excel_path = f"{stock_info["股票代码"]}_{stock_info["股票名称"]}_{end_date}.xlsm"
+    # 1. 获取当前日期字符串 (格式如: 2026-07-27)
+    current_date_str = datetime.now().strftime("%Y-%m-%d")
+
+    # 2. 定义目标文件夹路径
+    output_dir = Path(current_date_str)
+
+    # 3. 自动创建文件夹（若文件夹已存在则忽略）
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 4. 拼接完整的文件路径
+    excel_path = output_dir / f"{stock_info['股票代码']}_{stock_info['股票名称']}_{end_date}.xlsm"
+    #excel_path = f"{stock_info["股票代码"]}_{stock_info["股票名称"]}_{end_date}.xlsm"
 
     # 保存文件
     wb.save(excel_path)
