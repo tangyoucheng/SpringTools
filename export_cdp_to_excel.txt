@@ -133,10 +133,10 @@ def export_cdp_to_excel(
 
     # 生成动态文件名
     # 1. 获取当前日期字符串 (格式如: 2026-07-27)
-    current_date_str = datetime.now().strftime("%Y-%m-%d")
+    #current_date_str = datetime.now().strftime("%Y-%m-%d")
 
     # 2. 定义目标文件夹路径
-    output_dir = Path(current_date_str)
+    output_dir = Path(end_date)
 
     # 3. 自动创建文件夹（若文件夹已存在则忽略）
     output_dir.mkdir(parents=True, exist_ok=True)
