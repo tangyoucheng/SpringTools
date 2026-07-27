@@ -1,3 +1,4 @@
+#cdp_poc_today_ATR.py
 import os
 import sys
 import datetime
@@ -8,70 +9,10 @@ import yfinance as yf
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 假设 stock_dict 从配置中导入，若本地测试可自行定义
-from CDP_poc_config import stock_dict
-
-
-import datetime
-import yfinance as yf
-import numpy as np
-import pandas as pd
+from CDP_poc_today_config import stocks_list
 
 # =========================================================================
-# 【完美修复】独立方法：动态获取历史日K线并计算最新的 14日 ATR（盘中锁死至昨收）
-# =========================================================================
-def fetch_yesterday_stable_atr(ticker_symbol, period_days=14):
-    """
-    【盘前锁定组件】精准版：动态获取历史日线并计算截至昨天的稳定 14日 ATR
-    （彻底封杀时区模糊判断，确保即使盘中没有今天日K线也绝不误切昨天）
-    """
-    try:
-        now = datetime.datetime.now()
-        # 往前狠取 65 天确保节假日冗余，往后多取 1 天确保闭合
-        start_date = now - datetime.timedelta(days=65)
-        end_date = now + datetime.timedelta(days=1)
-        
-        df_hist = yf.download(ticker_symbol, start=start_date.strftime("%Y-%m-%d"), 
-                              end=end_date.strftime("%Y-%m-%d"), interval="1d", progress=False)
-        if df_hist.empty:
-            return None
-        
-        if isinstance(df_hist.columns, pd.MultiIndex):
-            df_hist.columns = df_hist.columns.get_level_values(0)
-
-        # 🚨 【时区对齐硬核防御】：强制转换 index 并提取纯日期对象进行无缝对比
-        df_hist.index = pd.to_datetime(df_hist.index).tz_localize(None)
-        today_date = now.date()
-
-        # 只有当下载的数据最后一行【确实是今天】时，才执行切除今天、锁定昨天的动作
-        if df_hist.index[-1].date() == today_date:
-            df_hist = df_hist.iloc[:-1]
-
-        if len(df_hist) < period_days:
-            return None
-
-        # NumPy并行，从第二天起对齐计算TR，确保首日无截断失真
-        high = df_hist['High'].to_numpy().flatten()
-        low = df_hist['Low'].to_numpy().flatten()
-        close = df_hist['Close'].to_numpy().flatten()
-        
-        tr_np = np.zeros_like(high)
-        tr_np[0] = high[0] - low[0] # 第一天初始种子
-        
-        high_low = high[1:] - low[1:]
-        high_close_prev = np.abs(high[1:] - close[:-1])
-        low_close_prev = np.abs(low[1:] - close[:-1])
-        tr_np[1:] = np.maximum(high_low, np.maximum(high_close_prev, low_close_prev))
-        
-        tr_series = pd.Series(tr_np)
-        atr_series = tr_series.ewm(alpha=1/period_days, adjust=False).mean()
-        return float(atr_series.iloc[-1])
-    except Exception as e:
-        print(f" 🚨 fetch_yesterday_stable_atr 运行异常: {e}")
-        return None
-
-
-# =========================================================================
-# 【完美修复】当日分时自适应 ATR 直方图算法（引入开盘安全气囊与 OHLC 投射）
+# 【完美修复】当日分时自适应 14日ATR 直方图算法（引入开盘安全气囊与 OHLC 投射）
 # =========================================================================
 def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
     """
@@ -136,10 +77,8 @@ def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
 # =========================================================================
 if __name__ == "__main__":
     #target_stock = "688037.SS"  # 以芯源微为例
-    stock_codes = list(stock_dict.keys())
-    for stock_code in stock_codes:
-        # 转换为字符串，防止原数据是数字类型
-        stock_code = str(stock_code)
+    for stock in stocks_list:
+        stock_code = str(stock['stockCode'])
         
         # 判断是否已经带了后缀，如果没有，则根据规则拼接
         if not (stock_code.endswith('.SS') or stock_code.endswith('.SZ')):
@@ -151,20 +90,18 @@ if __name__ == "__main__":
         else:
             target_stock = stock_code
 
-        stock_name = stock_dict.get(
-            stock_code,
-            "未知股票"
-        )  
+        stock_name = stock['stockName']        
             
         print(f"🏁 激活盘中自适应量化扫描，当前监控标的: {target_stock} {stock_name}")
         
         # 1. ⚙️ 计算昨收闭合的 14日历史波动率作为今日网格硬标尺
-        yesterday_atr = fetch_yesterday_stable_atr(target_stock, period_days=14)
+        #yesterday_atr = fetch_yesterday_stable_atr(target_stock, period_days=14)
+        yesterday_atr = stock['atr14D']
         if yesterday_atr is None or np.isnan(yesterday_atr):
             yesterday_atr = 340.0 * 0.04  # 假设的虚拟兜底
             print(f" ⚠️ 盘前未抓到稳定ATR，触发安全熔断：自动采用虚拟 ATR ({yesterday_atr:.2f}元) 锁定今日标尺")
         else:
-            print(f" 🟢 历史波动率标尺锁定成功！今日自适应网格基准 ATR 为: {yesterday_atr:.3f}元")
+            print(f" 🟢 历史波动率标尺锁定成功！今日自适应网格基准 14日ATR 为: {yesterday_atr}元")
 
         # 2. 📡 实时抓取【今天开盘以来截止到此时此刻】最新的 1分钟级 实时分时图数据
         print(f"📡 正在下载今日开盘至今的最新分时流数据...")
