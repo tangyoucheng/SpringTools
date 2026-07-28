@@ -5,73 +5,166 @@ import datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from curl_cffi import requests
 
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 假设 stock_dict 从配置中导入，若本地测试可自行定义
 from cdp_poc_today_ATR_config import stocks_list
 
-# =========================================================================
-# 【完美修复】当日分时自适应 14日ATR 直方图算法（引入开盘安全气囊与 OHLC 投射）
-# =========================================================================
-def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
-    """
-    【当日分时核心组件】完美重构版：高频分时日内成交量直方图堆叠
-    （封杀开盘前5分钟空箱体越界崩溃漏洞，支持OHLC等权分量投射）
-    """
-    try:
-        # Pandas层面数据硬对齐，彻底废除尾部盲目截断错位硬伤
-        df_clean = df_today.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
-        if df_clean.empty or len(df_clean) < 2:
-            return None
+# 使用 curl_cffi 强行伪装成真实的真实 Chrome 浏览器
+session = requests.Session(impersonate="chrome")
 
+# =========================================================================
+# 1. 建立 A股 专属的单日分时自适应 ATR 矩阵
+# =========================================================================
+intraday_ratios = {
+    "p_05": 0.05,   # 细网格：捕捉高频瞬时多空换手
+    "p_12": 0.125,  # 标准网格：筹码骨架
+    "p_20": 0.20,   # 防噪粗网格：1/5 日内波幅过滤毛刺（作为审计锚定基准）
+    "p_40": 0.40    # 宏观大本营
+}
+
+def calculate_advanced_poc(df_today, yesterday_atr):
+    """
+    【终极防弹 3.0 完美形态】当日分时自适应 POC 计算与智能审计系统
+    """
+    if df_today.empty or len(df_today) < 1:
+        return (df_today["Close"].iloc[-1] if not df_today.empty else None), "⚠️ 数据不足"
+
+    # 清洗数据
+    df_clean = df_today.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).copy()
+    if df_clean.empty:
+        return df_today["Close"].iloc[-1], "⚠️ 清洗后无有效数据"
+
+    # 计算 4 大矩阵结果及对应的 bins 结构
+    poc_matrix = {}
+    bins_matrix = {}
+    counts_matrix = {}
+    
+    for key, atr_multiplier in intraday_ratios.items():
+        poc_val, bins_arr, counts_arr = run_intraday_perfect_grid(df_clean, atr_multiplier, yesterday_atr)
+        poc_matrix[key] = poc_val
+        bins_matrix[key] = bins_arr
+        counts_matrix[key] = counts_arr
+
+    p_05 = poc_matrix["p_05"]
+    p_20 = poc_matrix["p_20"]
+
+    # 兜底：如果核心网格计算失败（包含返回 None 的场景），返回收盘价
+    if p_05 is None or p_20 is None:
+        return round(float(df_clean["Close"].iloc[-1]), 3), "⚠️ 网格初始化失败，采信尾盘收盘价"
+
+    # =========================================================================
+    # 4. 🤖 智能裁决系统（3.0 修复版：NumPy 属性拦截与优雅 zip 解包）
+    # =========================================================================
+    audit_threshold = 0.20 * yesterday_atr  # 严防死守，锁死 20% ATR 的最大容忍偏离度
+
+    if abs(p_05 - p_20) > audit_threshold:
+        bins_20 = bins_matrix["p_20"]
+        counts_20 = counts_matrix["p_20"]
+        
+        # ⚡【修补 1：NumPy 规范检查】：采用 Python 布尔判定结合 .size 属性，兼顾可读性与无越界安全
+        if counts_20 is None or bins_20 is None or counts_20.size == 0:
+            return p_20, f"🚨 拦截异常脉冲！粗网格数据异常或触发安全气囊，强制回滚至粗网格中轴({p_20:.2f}元)"
+            
+        max_idx_20 = np.argmax(counts_20)
+        
+        # 确定粗网格锁定下的主战场价格边界（绝对安全区域）
+        low_bound = bins_20[max_idx_20]
+        high_bound = bins_20[max_idx_20 + 1]
+        
+        # 调取细网格数据
+        bins_05 = bins_matrix["p_05"]
+        counts_05 = counts_matrix["p_05"]
+        
+        # 安全前置判定
+        if counts_05 is None or bins_05 is None or counts_05.size == 0:
+            return p_20, f"🚨 拦截异常脉冲！细网格阵列为空，强制回滚至粗网格中轴({p_20:.2f}元)"
+        
+        # ⚡【修补 2：zip 切片优雅解包】：彻底解决 [i+1] 隐性越界炸弹，代码逻辑直接拉满
+        valid_indices = []
+        # 将 counts 和前后错开 1 格的 bins 打包成三元组迭代器
+        for idx, (g_low, g_high) in enumerate(zip(bins_05[:-1], bins_05[1:])):
+            # 只要细网格区间与粗网格主战场区间存在交集或切点重合，即视为有效备选细网格索引
+            if max(low_bound, g_low) <= min(high_bound, g_high):
+                valid_indices.append(idx)
+        
+        if valid_indices:
+            valid_indices = np.array(valid_indices)
+            # 在安全的局部重叠范围内，找出筹码最密集的细网格索引
+            best_sub_idx = valid_indices[np.argmax(counts_05[valid_indices])]
+            final_poc = round(float((bins_05[best_sub_idx] + bins_05[best_sub_idx + 1]) / 2), 3)
+            audit_status = f"🚨 拦截脉冲骗线！已在主战场范围[{low_bound:.2f}-{high_bound:.2f}]内完成细网格寻优 -> ({final_poc:.2f}元)"
+        else:
+            final_poc = p_20  
+            audit_status = f"🚨 拦截异常脉冲！未找到几何交集，强制回滚至粗网格中轴({p_20:.2f}元)"
+    else:
+        final_poc = p_05
+        audit_status = f"🟢 多空真实换手共振，未见脉冲骗线，采信高精度极细网格({p_05:.2f}元)"
+
+    return final_poc, audit_status
+
+
+# =========================================================================
+# 【无漏洞核心组件】高频分时日内成交量直方图
+# =========================================================================
+def run_intraday_perfect_grid(df_clean, atr_multiplier, base_atr):
+    try:
         bin_size = base_atr * atr_multiplier
         if bin_size < 0.01:
             bin_size = 0.01
 
-        # 包含High和Low，全面捕捉真实价格震荡边界
         intraday_high = float(df_clean["High"].max())
         intraday_low = float(df_clean["Low"].min())
+        price_range = intraday_high - intraday_low
+
+        # 双道防零锁死。严防一字板或 price_range=0 导致重算步长归零，绝育死循环
+        if (price_range / bin_size) > 1000:
+            bin_size = price_range / 800.0  
         
-        # 强制右边界闭合
+        if bin_size < 0.01:
+            bin_size = 0.01
+
+        # 注入 1e-5 扰动项，消除 np.arange 浮点数边界截断硬伤
         bins = np.arange(
             intraday_low - bin_size * 5,
-            intraday_high + bin_size * 5 + bin_size,
+            intraday_high + bin_size * 5 + bin_size + 1e-5,
             bin_size,
         )
 
-        # 🚨 【开盘安全气囊】：防御早盘极端空箱体导致的系统越界死机
+        # 安全气囊返回值对齐：遇到不可算极端状态，counts 返回标准的空阵列
         if len(bins) < 2:
-            return (intraday_high + intraday_low) / 2
+            return round(float((intraday_high + intraday_low) / 2), 3), np.array([intraday_low, intraday_high]), np.array([])
 
-        # 🚨 【OHLC四点成交量并行投射】：将1分钟线内的能量真实还原至直方图
-        o = df_clean["Open"].to_numpy().flatten()
-        h = df_clean["High"].to_numpy().flatten()
-        l = df_clean["Low"].to_numpy().flatten()
-        c = df_clean["Close"].to_numpy().flatten()
-        v = df_clean["Volume"].to_numpy().flatten()
+        # 采用高频量化“典型价”单点投射法，封杀上下影线虚空吸量
+        typical_prices = ((df_clean["High"] + df_clean["Low"] + df_clean["Close"]) / 3.0).to_numpy().flatten()
+        volumes = df_clean["Volume"].to_numpy().flatten()
 
-        combined_prices = np.concatenate([o, h, l, c])
-        combined_volumes = np.concatenate([v, v, v, v]) / 4.0
+        # A股集合竞价与极端缩量一字板特殊过滤
+        is_auction = (df_clean["Open"] == df_clean["Close"]) & (df_clean["High"] == df_clean["Low"])
+        volumes_adjusted = np.where(is_auction, volumes * 0.3, volumes) 
 
-        counts, _ = np.histogram(combined_prices, bins=bins, weights=combined_volumes)
+        # 运行直方图频数统计
+        counts, _ = np.histogram(typical_prices, bins=bins, weights=volumes_adjusted)
         
-        # 极致防守：如果没有成交量，返回中轴
         if counts.sum() == 0:
-            return (intraday_high + intraday_low) / 2
+            center = round(float((intraday_high + intraday_low) / 2), 3)
+            return center, bins, counts
             
         max_idx = np.argmax(counts)
         
-        # 终极防御：若索引超出边界，强行安全截断返回
         if max_idx >= len(counts) or (max_idx + 1) >= len(bins):
-            return (intraday_high + intraday_low) / 2
+            center = round(float((intraday_high + intraday_low) / 2), 3)
+            return center, bins, counts
 
-        return round(float((bins[max_idx] + bins[max_idx + 1]) / 2), 3)
+        poc_value = round(float((bins[max_idx] + bins[max_idx + 1]) / 2), 3)
+        return poc_value, bins, counts
+
     except Exception as e:
-        print(f" 🚨 run_intraday_single_grid_atr 运行异常: {e}")
-        return (df_today["Close"].iloc[-1] if not df_today.empty else None)
-
-
+        print(f" 🚨 run_intraday_perfect_grid 运行异常: {e}")
+        return None, None, None
+        
 # =========================================================================
 # 【手动一键执行总控入口】
 # =========================================================================
@@ -105,7 +198,7 @@ if __name__ == "__main__":
 
         # 2. 📡 实时抓取【今天开盘以来截止到此时此刻】最新的 1分钟级 实时分时图数据
         print(f"📡 正在下载今日开盘至今的最新分时流数据...")
-        df_today = yf.download(target_stock, period="1d", interval="1m", progress=False)
+        df_today = yf.download(target_stock, period="1d", interval="1m", progress=False, session=session)
         
         if isinstance(df_today.columns, pd.MultiIndex):
             df_today.columns = df_today.columns.get_level_values(0)
@@ -114,31 +207,8 @@ if __name__ == "__main__":
             print(f"🚨 错误：未能在盘中抓取到有效的实时分时Tick数据，请检查网络或确认当前是否处于A股交易时段！")
             sys.exit(0)
 
-        # 3. 建立 A股 专属的单日分时 4 大 ATR 矩阵
-        intraday_ratios = {
-            "p_005": 0.05,    # 0.05倍 ATR (中长精密) -> 捕捉高频瞬时多空换手（步长约 0.04元）
-            "p_010": 0.125,   # 0.125倍 ATR (战略标准) -> 私募推荐标准筹码骨架（步长约 0.10元）
-            "p_0020": 0.25,   # 0.25倍 ATR (波段防噪) -> 四分之一日内波幅过滤毛刺（步长约 0.20元）
-            "p_0050": 0.40,   # 🚨 【修正优化】：从 0.60 降至 0.40 倍 ATR (牛熊大本营)
-                              # 确保全天振幅内至少能切出 3-4 个格子，既锚定宏观，又保留价格敏感度（步长约 0.32元）
-        }
-
-        # 并发矩阵堆积筹码计算
-        poc_matrix = {}
-        for key, atr_multiplier in intraday_ratios.items():
-            poc_matrix[key] = run_intraday_single_grid_atr(df_today, atr_multiplier, yesterday_atr)
-
-        # 4. 🤖 智能裁决系统（当日盘中防噪声骗线审计）
-        p_005 = poc_matrix["p_005"]
-        p_020 = poc_matrix["p_0020"]
-        audit_threshold = 0.20 * yesterday_atr  # 当日分时：严防死守，锁死 20% ATR 的最大容忍偏离度
-
-        if abs(p_005 - p_020) > audit_threshold:
-            final_poc = p_020  # 自动触发盘中熔断，强制采信粗网格合并后的真实主战场
-            audit_status = f"🚨 盘中拦截异常脉冲！细格子失真({p_005:.2f}元)，系统强制启动防噪网格"
-        else:
-            final_poc = p_005  # 如果价差很小，说明盘中多空交火很干净，使用最精准的细网格
-            audit_status = "🟢 盘中筹码吻合共振，多空真实交火，采信高精度极细网格"
+        # 🚀 调度运行你的终极 POC 算法
+        final_poc, audit_status = calculate_advanced_poc(df_today, yesterday_atr)
 
         # 5. 运行宏观 2倍POC加权 CDP 五关价公式体系 (纯净日内分时原生交互版)
         # 🚨 【绝杀降维改写】利用 to_numpy().flatten() 无条件将其还原为干净的一维数字链
@@ -176,3 +246,4 @@ if __name__ == "__main__":
             print(f"    💡 【实战备忘】: 现价已突破 NH 线，多头动能逼近上限，可执行高抛锁定利润。")
         else:
             print(f"    💡 【实战备忘】: 当前处于多空拉锯腹地，策略建议：持股观望，静待回踩或突破。")
+        print(f"\n\n")
