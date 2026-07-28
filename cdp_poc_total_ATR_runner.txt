@@ -4,10 +4,13 @@ import os
 import sys
 import json
 import datetime
+#import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from tabulate import tabulate
+
+from curl_cffi import requests
 
 
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
@@ -22,9 +25,12 @@ from cdp_poc_total_ATR import execute_all_period_pipeline
 from common_atr import fetch_dynamic_atr
 from common_Actual_Date_info import get_stock_metrics_by_calendar
 from common_number import RoundingStyle
-
-        
+    
 if __name__ == "__main__":
+
+    # 使用 curl_cffi 强行伪装成真实的真实 Chrome 浏览器
+    session = requests.Session(impersonate="chrome")
+
     # =========================================================================
     # 🚨 【测试控制台核心变量配置区】
     # =========================================================================
@@ -105,7 +111,7 @@ if __name__ == "__main__":
         
         # 2. 抓取多日大周期历史日线数据
         print(f"📡 正在调取 【{target_stock} {stock_name}】 交易所底仓K线流数据...")
-        df_daily_raw = yf.download(target_stock, start=start_date_past, end=download_end_dt, interval="1d", progress=False, auto_adjust=True, group_by='ticker')
+        df_daily_raw = yf.download(target_stock, start=start_date_past, end=download_end_dt, interval="1d", progress=False, auto_adjust=True, group_by='ticker', session=session)
         
         if df_daily_raw.empty:
             print(f"🚨 错误：未能获取到历史日K线数据，请检查网络或更换标的代码！")
@@ -147,10 +153,10 @@ if __name__ == "__main__":
         # 3. 抓取当日高频分时数据
         if CHOSEN_END_DATE is not None:
             # 复盘历史时，抓取指定日当天的 1分钟 极细分时图进行完全还原
-            df_intraday_raw = yf.download(target_stock, start=CHOSEN_END_DATE, end=download_end_dt, interval="1m", progress=False, auto_adjust=True, group_by='ticker')
+            df_intraday_raw = yf.download(target_stock, start=CHOSEN_END_DATE, end=download_end_dt, interval="1m", progress=False, auto_adjust=True, group_by='ticker', session=session)
         else:
             # 实时最新情况，下载当前最新一天的 1分钟 分时
-            df_intraday_raw = yf.download(target_stock, period="1d", interval="1m", progress=False, auto_adjust=True, group_by='ticker')
+            df_intraday_raw = yf.download(target_stock, period="1d", interval="1m", progress=False, auto_adjust=True, group_by='ticker', session=session)
         
         if isinstance(df_intraday_raw.columns, pd.MultiIndex):
             df_intraday_raw.columns = df_intraday_raw.columns.get_level_values(-1)
