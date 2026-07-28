@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 假设 stock_dict 从配置中导入，若本地测试可自行定义
 from CDP_poc_config import stock_dict, OUTPUT_END_DATE,CURRENT_ATR_5
 from export_cdp_to_excel import export_cdp_to_excel
+from export_profit_margin_excel import export_profit_pool_to_excel
 
 # 导入上面写好的核心逻辑组件
 from cdp_poc_total_ATR import execute_all_period_pipeline
@@ -26,6 +27,8 @@ from common_atr import fetch_dynamic_atr
 from common_Actual_Date_info import get_stock_metrics_by_calendar
 from common_number import RoundingStyle
     
+
+CHOSEN_END_DATE = OUTPUT_END_DATE   
 if __name__ == "__main__":
 
     # 使用 curl_cffi 强行伪装成真实的真实 Chrome 浏览器
@@ -38,6 +41,7 @@ if __name__ == "__main__":
     
     # 打印最终结果1. 初始化一个空的总列表（放在循环外面）
     stocks_list = []
+    profit_margin_pool = [] #利润率
     
     stock_codes = list(stock_dict.keys())
     for stock_code in stock_codes:
@@ -63,7 +67,7 @@ if __name__ == "__main__":
         # 如果您想偶尔直接看今天最新的收盘价，请无条件将其【置为 None】(例如: CHOSEN_END_DATE = None)
         #CHOSEN_END_DATE = None  
         #CHOSEN_END_DATE = "2026-07-21"    
-        CHOSEN_END_DATE = OUTPUT_END_DATE   
+        #CHOSEN_END_DATE = OUTPUT_END_DATE   
 
         if CHOSEN_END_DATE is None:
             CHOSEN_END_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -199,6 +203,24 @@ if __name__ == "__main__":
                 results_board[days] = execute_all_period_pipeline(
                     target_stock, df_slice, sub_dates_pool, df_period_days=days, base_price=fallback_base_price, end_date_str=CHOSEN_END_DATE, base_atr=base_atr_14
                 )
+                
+        # 1. 从结果看板中安全获取 5天、60天、120天 周期的字典数据
+        res_5d = results_board[5]
+        res_60d = results_board[60]
+        res_120d = results_board[120]
+        # 2. 从各自周期的返回值中提取对应指标
+        # 注意：请将下面的 "final_poc"、"nh_poc"、"true_cdp" 替换为您实际代表 利润/回撤 的键名
+        final_poc_5d = res_5d["final_poc"]        # 5天对应的智能审定真POC
+        final_poc_60d = res_60d["final_poc"]        # 60天对应的智能审定真POC
+        final_poc_120d = res_120d["final_poc"]  # 120天对应的智能审定真POC
+        # 3. 将格式化后的数据追加到利润率池中
+        profit_margin_pool.append({
+            "股票代码": target_stock,
+            "股票名称": stock_name,
+            "5天短线利润": f"{round((final_poc_5d-stock_metrics_close_p)/stock_metrics_close_p* 100, 2)}%",
+            "60日线(季度)利润": f"{round((final_poc_60d-stock_metrics_close_p)/stock_metrics_close_p* 100, 2)}%",
+            "120日线(半年)利润": f"{round((final_poc_120d-stock_metrics_close_p)/stock_metrics_close_p* 100, 2)}%"
+        })
 
         # 5. 工业级多周期终判对齐战略总看板打印
         print("\n" + "🛡️"*12 + " 全周期量化终判对齐审计复盘 " + "🛡️"*12)
@@ -291,7 +313,18 @@ if __name__ == "__main__":
         }
         # 打印最终结果3. 追加到总列表中
         stocks_list.append(formatted_stock)  
-              
+    
+    print(profit_margin_pool)
+    #60日线(季度)利润降序排序
+    profit_margin_pool.sort(
+        key=lambda x: float(x["60日线(季度)利润"].replace("%", "")), 
+        reverse=True
+    )
+    export_profit_pool_to_excel(
+        profit_pool=profit_margin_pool,
+        end_date=CHOSEN_END_DATE
+    )
+    
     # 打印最终结果4. 打印最终结果
     #print(stocks_list)
     #for stock in stocks_list:
