@@ -4,8 +4,9 @@ import numpy as np
 
 def generate_ultimate_matrix_data_cn(stock_info, excel_data):
     """
-    零人工干预·纯数据驱动型矩阵自演化筹码墙算法（彻底放弃凑数据、恢复100%纯净数学网格版）
+    零人工干预·纯数据驱动型矩阵自演化筹码墙算法（终极净化无隐患完全体版）
     """
+    # 在最前置源头强制统一强类型，封死底层浮点数精度漂移
     close_p = float(stock_info["收盘价"])
     atr_5d = float(stock_info["5日ATR"])
     
@@ -13,8 +14,8 @@ def generate_ultimate_matrix_data_cn(stock_info, excel_data):
     events = []
     events.append({"price": close_p, "label": str(f"★当前收盘价[{close_p}]"), "weight": 6})
     
-    panic_line = round(close_p - atr_5d, 2)
-    events.append({"price": float(panic_line), "label": str(f"⚠️日内恐慌激活线({panic_line})"), "weight": 3})
+    panic_line = float(round(close_p - atr_5d, 2))
+    events.append({"price": panic_line, "label": str(f"⚠️日内恐慌激活线({panic_line})"), "weight": 3})
     
     for _, row in excel_data.iterrows():
         p_type = str(row["周期类型"])
@@ -28,10 +29,10 @@ def generate_ultimate_matrix_data_cn(stock_info, excel_data):
         
     df_events = pd.DataFrame(events)
     
-    # 2. 矩阵自演化网格生成（数据原生态，没有任何人为干预的放大阀门）
+    # 2. 矩阵自演化非均匀网格轴生成（绝对去重并降序排列）
     unique_prices = sorted(df_events["price"].unique(), reverse=True)
     
-    # 💡【回归纯净客观】拒绝为了凑出16格而人为放大窗口！严格保持万分之五与A股1.5分钱Tick的物理防线
+    # 严格保持标准对齐窗：高低价全自适应 TickSize 心理窗（1.5分钱保底）
     tick_window = max(close_p * 0.0005, 0.015)
     processed_prices = set()
     
@@ -40,6 +41,7 @@ def generate_ultimate_matrix_data_cn(stock_info, excel_data):
     for idx in range(len(unique_prices)):
         current_p = unique_prices[idx]
         
+        # 避免近似网格的二次重复处理
         if any(abs(current_p - p) <= tick_window for p in processed_prices):
             continue
             
@@ -53,27 +55,26 @@ def generate_ultimate_matrix_data_cn(stock_info, excel_data):
             labels = matched["label"].unique()
             label_str = str(" | ".join(labels))
             
-            # 将最真实、绝无水分的网格价格和能量条压入队列
+            # 将无水分的原生态网格节点压入队列
             wall_rows.append([float(round(current_p, 2)), bar_str, label_str])
                 
-            # 3. 纯客观上行断层审计
+            # 3. 【彻底修补：绝对相邻物理断层审计】
+            # 拒绝任何越级和主观跳过，只测算排序网格轴中绝对相邻的下一格
             if idx < len(unique_prices) - 1:
-                next_p = None
-                for n_p in unique_prices[idx + 1:]:
-                    if abs(n_p - current_p) > tick_window:
-                        next_p = n_p
-                        break
-                        
-                if next_p:
-                    gap = current_p - next_p
-                    relative_gap_ratio = gap / current_p
-                    base_vol_ratio = atr_5d / close_p
-                    
-                    if current_p > close_p and relative_gap_ratio > base_vol_ratio:
-                        atr_spans = round(gap / atr_5d, 1)
-                        alert_label = str("🚨 矩阵自演化提示：上方无任何历史筹码防线")
-                        alert_bar = str(f"  [↓ 绝对断层空间: {round(gap, 2)} 元 | 跨度约 {atr_spans} 个ATR]")
-                        wall_rows.append([0.0, alert_bar, alert_label])
+                next_p = unique_prices[idx + 1]
+                gap = current_p - next_p
+                
+                # 转化为无量纲收益率断层比例与现货标准相对波动率对比
+                relative_gap_ratio = gap / current_p
+                base_vol_ratio = atr_5d / close_p
+                
+                # 💡【修补重力场盲区】只要当前节点或下一个相邻节点处于现价上方，即证明断层横跨反弹阻力真空区
+                if (current_p > close_p or next_p > close_p) and relative_gap_ratio > base_vol_ratio:
+                    atr_spans = round(gap / atr_5d, 1)
+                    alert_label = str("🚨 矩阵自演化提示：上方无任何历史筹码防线")
+                    alert_bar = str(f"  [↓ 绝对断层空间: {round(gap, 2)} 元 | 跨度约 {atr_spans} 个ATR]")
+                    # 强类型Numeric隔离，写入0.0供Excel模块拦截，彻底根除公式损坏报错
+                    wall_rows.append([0.0, alert_bar, alert_label])
 
     wall_headers = ["绝对价格(元)", "筹码能量条 (绝对数学重叠)", "触发技术位/多周期共振审计标签说明"]
     return pd.DataFrame(wall_rows, columns=wall_headers)
