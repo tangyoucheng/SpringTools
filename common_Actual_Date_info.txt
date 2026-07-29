@@ -1,17 +1,19 @@
+#common_Actual_Date_info.py
+
+import datetime
 import os
 import sys
-import datetime
 import numba
 import numpy as np
-import pandas as pd
-import yfinance as yf
 import exchange_calendars as xcals
+import pandas as pd
 import pytz  # 🚨 引入时区库，确保全球服务器运行都能锁定北京时间
+import yfinance as yf
 
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-    
+
 def get_stock_metrics_by_calendar(ticker: str, target_date: str) -> dict | None:
     """【资产管理级日历自适应核心组件 - 终极时区去伪存真版】
 
@@ -30,7 +32,7 @@ def get_stock_metrics_by_calendar(ticker: str, target_date: str) -> dict | None:
         target_date_str = target_dt.strftime("%Y-%m-%d")
 
         # 2. 冗余窗口控制：往前狠取 12 天（对冲十一长假、春节长假断流），往后多取 1 天配合左闭右开
-        start_date = target_dt - datetime.timedelta(days=12)
+        start_date = target_dt - datetime.timedelta(days=60)
         end_date = target_dt + datetime.timedelta(days=1)
 
         # 3. 开启前复权下载历史行情
@@ -50,17 +52,47 @@ def get_stock_metrics_by_calendar(ticker: str, target_date: str) -> dict | None:
             return None
 
         # 4. 多重列索引解包降维保护
+        # 🚨【降维重构：全自适应表头解包引擎，彻底封杀 KeyError 'Close'】
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+            core_fields = ["Close", "High", "Low", "Open", "Volume"]
+            found_level = None
+            for lvl in range(df.columns.nlevels):
+                test_cols = [
+                    str(c).lower().capitalize()
+                    for c in df.columns.get_level_values(lvl)
+                ]
+                if any(f in test_cols for f in core_fields):
+                    found_level = lvl
+                    break
+
+            if found_level is not None:
+                df.columns = df.columns.get_level_values(found_level)
+            else:
+                df.columns = [
+                    str(col) if isinstance(col, tuple) else str(col)
+                    for col in df.columns
+                ]
 
         # 🚨【核心修正：列名大小写强行对齐】
         # 将列名强制格式化为首字母大写（High, Low, Close, Volume），彻底拍死 KeyError 隐患
-        df.columns = [col.lower().capitalize() for col in df.columns]
+        df.columns = [str(col).lower().capitalize() for col in df.columns]
 
         # 洗净 index 的时区魔鬼，转换为标准的十进制日期字符串
         df.index = (
             pd.to_datetime(df.index).tz_localize(None).strftime("%Y-%m-%d")
         )
+
+        # 🚨【增补防线：基于成交量强力剔除停牌/断流的假前向填充行】
+        # 针对 yfinance 对 A股停牌期虚填收盘价的特性，用 Volume <= 0 作为硬切除标尺
+        if "Volume" in df.columns:
+            # 过滤掉成交量为 NaN、0 或者负数的所有僵尸交易日
+            df = df[df["Volume"].notna() & (df["Volume"] > 0)].copy()
+        elif "Close" in df.columns:
+            df = df.dropna(subset=["Close"]).copy()
+
+        if df.empty:
+            print(f" 🚨 提示: {ticker} 在指定区间内无任何开盘或有效成交数据。")
+            return None
 
         # 5. 🚨【核心修正：北京时间 15:00 盘中残缺K线切片剔除引擎】
         # 严格采信北京时间的今日日历
@@ -108,11 +140,11 @@ def get_stock_metrics_by_calendar(ticker: str, target_date: str) -> dict | None:
 
         # 如果提取出来依然是多维数组，取第一个元素
         if isinstance(close_v, (np.ndarray, pd.Series)):
-            close_v = close_v.flatten()[0]
+            close_v = close_v.flatten()
         if isinstance(high_v, (np.ndarray, pd.Series)):
-            high_v = high_v.flatten()[0]
+            high_v = high_v.flatten()
         if isinstance(low_v, (np.ndarray, pd.Series)):
-            low_v = low_v.flatten()[0]
+            low_v = low_v.flatten()
 
         # 8. 绝对无损包装，抛回给上层风控总线
         return {
@@ -125,3 +157,17 @@ def get_stock_metrics_by_calendar(ticker: str, target_date: str) -> dict | None:
     except Exception as e:
         print(f" 🚨 get_stock_metrics_by_calendar 运行异常: {e}")
         return None
+
+
+# ================== 执行演示 ==================
+if __name__ == "__main__":
+    stock_metrics_result = get_stock_metrics_by_calendar(
+        "688277.SS", "2026-07-29"
+    )
+
+    if stock_metrics_result is not None:
+        stock_metrics_actual_date = stock_metrics_result["Actual_Date"]
+        print(f" 🚨最近交易日 : {stock_metrics_actual_date}")
+        print(f" 🚨指标数据 : {stock_metrics_result}")
+    else:
+        print(" 🚨未获取到有效数据")
