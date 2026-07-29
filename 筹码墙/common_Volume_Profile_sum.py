@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # 💡【无缝对齐】导入第二个独立脚本中的 Excel 导出函数
 from export_profit_margin_wave1_excel import export_profit_pool_to_excel
+from common_stock import detect_stock_board_and_suffix
 
 def scan_highest_near_rebound_profit(end_date):
     """
@@ -36,7 +37,12 @@ def scan_highest_near_rebound_profit(end_date):
             stock_code = str(df_stock.iloc[1, 1])  # B33 股票代码
             stock_name = str(df_stock.iloc[1, 2])  # C33 股票名称
             close_price = float(df_stock.iloc[1, 3]) # D33 最新收盘价
-            atr_5d = float(df_stock.iloc[1, 7])      # H33 5日ATR
+            atr_5d = float(df_stock.iloc[1, 7])      # H33 5日ATR            
+            
+            target_stock, board_name = detect_stock_board_and_suffix(stock_code)
+            # 🚨 完美写法：如果板块名称不在这个指定的“双创”池子里，直接跳过
+            if board_name not in ("科创板", "创业板"):
+                continue
 
             # 读取下方的动态自演化筹码墙区域
             df_wall = pd.read_excel(
