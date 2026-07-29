@@ -6,15 +6,20 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill
 from enum import Enum
 from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, ROUND_DOWN
 
 # 使用免安装版本时，为了读取CDP_config.py，添加的设定
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common_number import RoundingStyle
+from common_Volume_Profile import generate_ultimate_matrix_data_cn
 
 
         
+
+# 1. 事先定义好和模板一模一样的字体（比如：微软雅黑，11号，不加粗）
+template_font = Font(name="微软雅黑", size=11, bold=False)
 
 #stock_info = {
 #    "股票代码": target_stock,
@@ -61,15 +66,13 @@ def export_cdp_to_excel(
         if days <= 5:
             name_str = f"{days}天短线历史"
         else:
-            name_str = (
-                f"20日线(月度)"
-                if days == 20
-                else (
-                    f"60日线(季度)"
-                    if days == 60
-                    else (f"120日线(半年)" if days == 120 else f"250日线(年度)")
-                )
-            )
+            days_map = {
+                20: "20日线(月度)",
+                60: "60日线(季度)",
+                120: "120日线(半年)"
+            }
+            # 匹配不上字典里的 20、60、120 时，默认返回 250 日线
+            name_str = days_map.get(days, "250日线(年度)")
 
         table_rows.append(
             [
@@ -85,7 +88,9 @@ def export_cdp_to_excel(
 
     # 将二维列表转为 DataFrame 备用
     excel_data = pd.DataFrame(table_rows, columns=headers)
-
+    # 筹码墙
+    chips_wall_df = generate_ultimate_matrix_data_cn(stock_info, excel_data)
+    
     # ======================
     # 写入Excel模板
     # ======================
@@ -95,42 +100,83 @@ def export_cdp_to_excel(
     ws = wb["Sheet1"]
 
     # 清空旧数据
-    ws.delete_rows(1, ws.max_row)
+    #ws.delete_rows(22, ws.max_row)
 
     # 💡 核心控制：定义全局起始列（2 代表 B列）
     START_COL = 2
-    START_ROW = 2
+    START_ROW = 31
 
     # 【第一行第一列】：输出结束日期 end_date（第一行的其余列保持空白）
     # 依然保持在 A1，不受 START_COL 影响
-    ws.cell(row=START_ROW, column=START_COL, value=end_date)
+    ws.cell(row=START_ROW, column=START_COL, value=end_date).font = template_font
     START_ROW = START_ROW + 1;
 
     # 【第二行】：输出追加的股票属性表头（从第二列开始）
     # stock_info.keys() 会自动提取出 ["股票代码", "股票名称", "收盘价", "最高价", "最低价"]
     for col_idx, header_val in enumerate(stock_info.keys(), start=START_COL):
-        ws.cell(row=START_ROW, column=col_idx, value=header_val)
+        ws.cell(row=START_ROW, column=col_idx, value=header_val).font = template_font
     START_ROW = START_ROW + 1;
 
     # 【第三行】：输出对应的实际股票基本数据值（从第二列开始）
     # stock_info.values() 会自动提取出对应的实际数值（如 target_stock, stock_name 等）
     for col_idx, value_val in enumerate(stock_info.values(), start=START_COL):
-        ws.cell(row=START_ROW, column=col_idx, value=value_val)
+        ws.cell(row=START_ROW, column=col_idx, value=value_val).font = template_font
     START_ROW = START_ROW + 1;
 
     # 【第四行】：输出之前的 CDP/POC 数据的字段表头（从第二列开始）
     for col_idx, header in enumerate(excel_data.columns, start=START_COL):
-        ws.cell(row=START_ROW, column=col_idx, value=header)
+        ws.cell(row=START_ROW, column=col_idx, value=header).font = template_font
     START_ROW = START_ROW + 1;
 
     # 【第五行及以后】：依次无缝输出具体的 POC 数据行（从第二列开始）
     for row_offset, row in enumerate(
         excel_data.itertuples(index=False), start=START_ROW
-    ):
+    ):        
+        START_ROW = row_offset;
         for col_idx, value in enumerate(row, start=START_COL):
-            ws.cell(row=row_offset, column=col_idx, value=value)
+            ws.cell(row=row_offset, column=col_idx, value=value).font = template_font
 
-
+    # 下拉平滑顺延，隔离视觉数据区
+    START_ROW += 2  
+    
+    # 写入筹码墙中文主大报头
+    ws.cell(row=START_ROW, column=START_COL, value=str(f"@@@@@@@@@@@@@@@@@@ 📊 {stock_info['股票名称']} 动态自演化立体筹码分布墙 @@@@@@@@@@@@@@@@@@")).font = template_font
+    ws.cell(row=START_ROW, column=START_COL).font = Font(name="微软雅黑",bold=True, size=11, color="104E8B")
+    START_ROW += 1
+    
+    #ws.cell(row=START_ROW, column=START_COL, value=str(f"当前收盘价: {stock_info['收盘价']} | 5日ATR: {round(stock_info['5日ATR'], 4)} | 零人工阀门硬核干预")).font = template_font
+    #ws.cell(row=START_ROW, column=START_COL).font = Font(name="微软雅黑",italic=True, size=10, color="555555")
+    #START_ROW += 2  
+    
+    # 写入筹码墙三列核心字段表头
+    for col_idx, wall_header in enumerate(chips_wall_df.columns, start=START_COL):
+        cell = ws.cell(row=START_ROW, column=col_idx, value=str(wall_header)).font = template_font
+        cell.font = Font(name="微软雅黑",bold=True)
+    START_ROW += 1
+    
+    # 灌入自演化网格数据
+    for row in chips_wall_df.itertuples(index=False):
+        for col_idx, value in enumerate(row, start=START_COL):
+            # 判断当前单元格数据，处理空白占位或强类型转换
+            if value == "":
+                ws.cell(row=START_ROW, column=col_idx, value="").font = template_font
+            elif isinstance(value, (int, float)):
+                ws.cell(row=START_ROW, column=col_idx, value=float(value)).font = template_font
+            else:
+                ws.cell(row=START_ROW, column=col_idx, value=str(value)).font = template_font
+                
+            cell = ws.cell(row=START_ROW, column=col_idx)
+            
+            # Excel专属条件颜色样式渲染
+            row_str = str(row)
+            if "★" in row_str:
+                cell.fill = PatternFill(start_color="FFE4E1", end_color="FFE4E1", fill_type="solid")
+                cell.font = Font(name="微软雅黑", size=11,color="8B0000", bold=True)
+            elif "🚨" in row_str:
+                cell.font = Font(name="微软雅黑", size=11,color="FF6600", italic=True)
+                    
+        START_ROW += 1
+        
     # 生成动态文件名
     # 1. 获取当前日期字符串 (格式如: 2026-07-27)
     #current_date_str = datetime.now().strftime("%Y-%m-%d")
