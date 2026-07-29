@@ -1,0 +1,216 @@
+Sub GenerateUltimateMatrixEvolutionCustomPivot()
+    Dim ws As Worksheet
+    Set ws = ActiveSheet
+    
+    ' =========================================================================
+    ' 🚨 【纯客观锚定配置区】在此自由指定数据的开始位置
+    ' =========================================================================
+    Dim startRow As Long, startCol As Long
+    startRow = 31  ' 👈 您指定的开始行号 (例如: 31)
+    startCol = 2   ' 👈 您指定的开始列号 (A=1, B=2, C=3, 以此类推，B31对应startCol=2)
+    ' =========================================================================
+    
+    ' 1. 动态测算审计输出区的位置（自动放在原始数据右侧，空出两列作为视觉安全隔离带）
+    Dim outCol As Long
+    outCol = startCol + 7 ' 自动将筹码墙打印在原始数据表格的右侧
+    ws.Range(ws.Cells(startRow, outCol), ws.Cells(startRow + 40, outCol + 2)).Clear
+    
+    ' 2. 纯客观读取指定起始单元格（如B31）里的股票基础数据
+    Dim stockCode As String, stockName As String
+    Dim closeP As Double, highP As Double, lowP As Double
+    Dim atr14 As Double, atr5 As Double
+    
+    ' 基于锚定点执行相对位移读取
+    stockCode = ws.Cells(startRow + 1, startCol).Value       ' 对应 B32
+    stockName = ws.Cells(startRow + 1, startCol + 1).Value   ' 对应 C32
+    closeP = ws.Cells(startRow + 1, startCol + 2).Value      ' 对应 D32
+    highP = ws.Cells(startRow + 1, startCol + 3).Value       ' 对应 E32
+    lowP = ws.Cells(startRow + 1, startCol + 4).Value        ' 对应 F32
+    atr14 = ws.Cells(startRow + 1, startCol + 5).Value       ' 对应 G32
+    atr5 = ws.Cells(startRow + 1, startCol + 6).Value        ' 对应 H32
+    
+    ' 排除空数据异常导致的量化计算崩溃
+    If closeP = 0 Or atr5 = 0 Then
+        MsgBox "🚨 错误：指定的起始单元格区域内未检测到有效的现货价格或ATR数据！", vbCritical, "数据源异常"
+        Exit Sub
+    End If
+    
+    ' 计算动态恐慌激活线
+    Dim panicLine As Double
+    panicLine = Round(closeP - atr5, 2)
+    
+    ' 3. 构建原生事件集合
+    Dim rawEvents As New Collection
+    Dim eventItem As Dictionary
+    
+    ' 压入当前价
+    Set eventItem = CreateObject("Scripting.Dictionary")
+    eventItem.Add "price", closeP: eventItem.Add "label", "★当前收盘价[" & closeP & "]": eventItem.Add "weight", 6
+    rawEvents.Add eventItem
+    
+    ' 压入日内恐慌激活线
+    Set eventItem = CreateObject("Scripting.Dictionary")
+    eventItem.Add "price", panicLine: eventItem.Add "label", "⚠️日内恐慌激活线(" & panicLine & ")": eventItem.Add "weight", 3
+    rawEvents.Add eventItem
+    
+    ' 4. 循环遍历多周期技术位（顺延至第33行至39行）
+    Dim i As Long
+    Dim pType As String, poc As Double, nl As Double, nh As Double
+    Dim techStartRow As Long, techEndRow As Long
+    techStartRow = startRow + 3 ' 31 + 3 = 33行
+    techEndRow = startRow + 9   ' 31 + 9 = 39行
+    
+    For i = techStartRow To techEndRow
+        pType = ws.Cells(i, startCol).Value       ' 对应 B 列的周期名称
+        poc = ws.Cells(i, startCol + 1).Value     ' 对应 C 列的真POC
+        nl = ws.Cells(i, startCol + 4).Value      ' 对应 F 列的低吸支撑NL
+        nh = ws.Cells(i, startCol + 5).Value      ' 对应 G 列的高抛阻力NH
+        
+        ' 压入真POC
+        Set eventItem = CreateObject("Scripting.Dictionary")
+        eventItem.Add "price", poc: eventItem.Add "label", pType & "真POC(" & poc & ")": eventItem.Add "weight", 5
+        rawEvents.Add eventItem
+        
+        ' 压入低吸支撑NL
+        Set eventItem = CreateObject("Scripting.Dictionary")
+        eventItem.Add "price", nl: eventItem.Add "label", pType & "低吸支撑NL(" & nl & ")": eventItem.Add "weight", 2
+        rawEvents.Add eventItem
+        
+        ' 压入高抛阻力NH
+        Set eventItem = CreateObject("Scripting.Dictionary")
+        eventItem.Add "price", nh: eventItem.Add "label", pType & "高抛阻力NH(" & nh & ")": eventItem.Add "weight", 2
+        rawEvents.Add eventItem
+    Next i
+    
+    ' 5. 全样本去重及冒泡降序排序
+    Dim uniquePrices() As Double
+    ReDim uniquePrices(1 To rawEvents.Count)
+    Dim k As Long, j As Long
+    For i = 1 To rawEvents.Count
+        uniquePrices(i) = rawEvents(i)("price")
+    Next i
+    
+    Dim temp As Double
+    For i = 1 To UBound(uniquePrices) - 1
+        For j = i + 1 To UBound(uniquePrices)
+            If uniquePrices(i) < uniquePrices(j) Then
+                temp = uniquePrices(i)
+                uniquePrices(i) = uniquePrices(j)
+                uniquePrices(j) = temp
+            End If
+        Next j
+    Next i
+    
+    ' 6. 设置高低价全自适应 Tick 共振窗（鸣志电器自动匹配为0.0235元）
+    Dim tickWindow As Double
+    If (closeP * 0.0005) > 0.015 Then
+        tickWindow = closeP * 0.0005
+    Else
+        tickWindow = 0.015
+    End If
+    
+    ' 7. 打印筹码分布墙报头
+    ws.Cells(startRow, outCol).Value = "================== 📊 " & stockName & " (" & stockCode & ") 矩阵自演化筹码墙 =================="
+    ws.Cells(startRow + 1, outCol).Value = "当前收盘价: " & closeP & " | 5日ATR: " & Round(atr5, 4) & " | 相对波动率: " & Round((atr5 / closeP) * 100, 2) & "%"
+    ws.Cells(startRow + 2, outCol).Value = "🤖 算法状态：零人工干预。高低价全自适应Tick报价盾牌已对齐。"
+    
+    Dim outputRow As Long
+    outputRow = startRow + 5
+    
+    ws.Cells(outputRow, outCol).Value = "绝对价格(元)"
+    ws.Cells(outputRow, outCol + 1).Value = "筹码能量条 (绝对数学重叠)"
+    ws.Cells(outputRow, outCol + 2).Value = "触发技术位/多周期共振审计标签说明"
+    ws.Range(ws.Cells(outputRow, outCol), ws.Cells(outputRow, outCol + 2)).Font.Bold = True
+    
+    outputRow = outputRow + 1
+    
+    ' 8. 遍历网格轴并绘制
+    Dim processedPrices As New Collection
+    Dim currentP As Double, nextP As Double
+    Dim isProcessed As Boolean
+    Dim totalWeight As Long
+    Dim barStr As String
+    Dim labelStr As String
+    Dim item As Variant
+    
+    For i = 1 To UBound(uniquePrices)
+        currentP = uniquePrices(i)
+        
+        isProcessed = False
+        For Each item In processedPrices
+            If Abs(currentP - item) <= tickWindow Then
+                isProcessed = True
+                Exit For
+            End If
+        Next item
+        
+        If Not isProcessed Then
+            processedPrices.Add currentP
+            totalWeight = 0
+            labelStr = ""
+            
+            For k = 1 To rawEvents.Count
+                If Abs(rawEvents(k)("price") - currentP) <= tickWindow Then
+                    totalWeight = totalWeight + rawEvents(k)("weight")
+                    If labelStr = "" Then
+                        labelStr = rawEvents(k)("label")
+                    Else
+                        If InStr(labelStr, rawEvents(k)("label")) = 0 Then
+                            labelStr = labelStr & " | " & rawEvents(k)("label")
+                        End If
+                    End If
+                End If
+            Next k
+            
+            barStr = String(totalWeight, "█")
+            
+            ws.Cells(outputRow, outCol).Value = Round(currentP, 2)
+            ws.Cells(outputRow, outCol + 1).Value = barStr
+            ws.Cells(outputRow, outCol + 2).Value = labelStr
+            
+            ' 高亮标出现价战区
+            If InStr(labelStr, "★") > 0 Then
+                ws.Range(ws.Cells(outputRow, outCol), ws.Cells(outputRow, outCol + 2)).Interior.Color = RGB(255, 235, 235)
+                ws.Range(ws.Cells(outputRow, outCol), ws.Cells(outputRow, outCol + 2)).Font.Color = RGB(200, 0, 0)
+            End If
+            
+            outputRow = outputRow + 1
+            
+            ' 9. 纯客观上行真空断层审计
+            If i < UBound(uniquePrices) Then
+                nextP = 0
+                For k = i + 1 To UBound(uniquePrices)
+                    If Abs(uniquePrices(k) - currentP) > tickWindow Then
+                        nextP = uniquePrices(k)
+                        Exit For
+                    End If
+                Next k
+                
+                If nextP > 0 Then
+                    Dim gap As Double, relativeGapRatio As Double, baseVolRatio As Double
+                    gap = current_p - nextP
+                    relativeGapRatio = gap / currentP
+                    baseVolRatio = atr5 / closeP
+                    
+                    If currentP > closeP and relativeGapRatio > baseVolRatio Then
+                        Dim atrSpans As Double
+                        atrSpans = Round(gap / atr5, 1)
+                        
+                        ws.Cells(outputRow, outCol + 1).Value = "  [↓ 绝对断层空间: " & Round(gap, 2) & " 元 | 跨度约 " & atrSpans & " 个ATR]"
+                        ws.Cells(outputRow, outCol + 2).Value = "🚨 矩阵自演化提示：上方无任何历史筹码防线"
+                        ws.Range(ws.Cells(outputRow, outCol + 1), ws.Cells(outputRow, outCol + 2)).Font.Color = RGB(255, 100, 0)
+                        ws.Range(ws.Cells(outputRow, outCol + 1), ws.Cells(outputRow, outCol + 2)).Font.Color = RGB(255, 100, 0)
+                        ws.Range(ws.Cells(outputRow, outCol + 1), ws.Cells(outputRow, outCol + 2)).Font.Italic = True
+                        
+                        outputRow = outputRow + 1
+                    End If
+                End If
+            End If
+            
+        End If
+    Next i
+    
+    ' 自动美化排版
+    ws.Range(ws.Cells(startRow, outCol), ws.Cells(startRow, outCol + 2)).Columns.AutoFit
+    MsgBox "📊 B31自适应矩阵筹码分布墙生成完毕！输出位置已自动向右对齐。", vbInformation, "前置风控雷达"
+End Sub
