@@ -160,14 +160,15 @@ def get_stock_metrics_by_calendar(ticker: str, target_date: str) -> dict | None:
 
 
 # ================== 执行演示 ==================
-if __name__ == "__main__":
-    stock_metrics_result = get_stock_metrics_by_calendar(
-        "688277.SS", "2026-07-29"
-    )
-
-    if stock_metrics_result is not None:
-        stock_metrics_actual_date = stock_metrics_result["Actual_Date"]
-        print(f" 🚨最近交易日 : {stock_metrics_actual_date}")
-        print(f" 🚨指标数据 : {stock_metrics_result}")
-    else:
-        print(" 🚨未获取到有效数据")
+#if __name__ == "__main__":
+#    stock_metrics_result = get_stock_metrics_by_calendar(
+#        "688277.SS", "2026-07-29"
+#    )
+#
+#    if stock_metrics_result is not None:
+#        stock_metrics_actual_date = stock_metrics_result["Actual_Date"]
+#        print(f" 🚨最近交易日 : {stock_metrics_actual_date}")
+#        print(f" 🚨指标数据 : {stock_metrics_result}")
+#    else:
+#        print(" 🚨未获取到有效数据")
+#
