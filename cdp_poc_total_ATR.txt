@@ -334,63 +334,100 @@ def run_intraday_single_grid_atr(df_today, atr_multiplier, base_atr):
 def _numba_compiled_composite_profile(
     prices, volumes, base_weights, start_bin, bin_size, num_bins
 ):
-    """【Numba LLVM 机器码最高御盾大周期内核 - V6.2 零拷贝版】
-
-    接受外部一维连续 C-Contiguous 矩阵，单次循环直接完成【多日量价时间衰减多点概率投射】。
-    运行期物理内存开辟严格为 0，彻底击穿多进程并发大回测下的 OOM 梦魇。
+    """【Numba大周期实体-影线自适应分配内核 - V6.3 完美重构完全体】
+    
+    完美保留零内存开辟(OOM防护)特征。
+    通过将日K线切分为[上影线、K线实体、下影线]三层重力空间，彻底封杀大振幅下的筹码稀释假量。
     """
     counts = np.zeros(num_bins, dtype=np.float64)
     num_days = len(volumes)
+    prices_len = len(prices)
 
-    # 🚨【核心重构：多日矩阵量价连续空间时空还原】
-    # 每一天的日K线贡献 4 个价格点（Open, High, Low, Close）
     for i in range(num_days):
+        # 1. 强行实施物理内存边界安全越界过筛，封杀底层指针越界 SegFault
+        p_idx = i * 4
+        if p_idx + 3 >= prices_len:
+            continue
+
         day_vol = volumes[i]
         day_weight = base_weights[i]
-        # 这一天最终在时间衰减矩阵下结算出的真实有效权重成交量
         final_weighted_vol = day_vol * day_weight
 
-        # 提取这根日K线的四个核心端点指针
-        p_idx = i * 4
+        if final_weighted_vol <= 0.0 or np.isnan(final_weighted_vol):
+            continue
+
+        # 2. 提取日K线核心价格端点
         o = prices[p_idx]
         h = prices[p_idx + 1]
         l = prices[p_idx + 2]
         c = prices[p_idx + 3]
 
-        if l > h:
-            h = l
+        if l > h: h = l
 
+        # 如果全天一字板或无波动，属于单点筹码堆积
         if h == l:
             idx = int((l - start_bin) / bin_size)
-            if idx < 0:
-                idx = 0
-            if idx >= num_bins:
-                idx = num_bins - 1
+            if idx < 0: idx = 0
+            if idx >= num_bins: idx = num_bins - 1
             counts[idx] += final_weighted_vol
             continue
 
-        # 双侧极限交叉物理剪切（Clip），锁死底层指针越界 SegFault
-        left_idx = int((l - start_bin) / bin_size)
-        if left_idx < 0:
-            left_idx = 0
-        if left_idx >= num_bins:
-            left_idx = num_bins - 1
+        # 3. 区分K线实体（Body）与上下影线（Shadows）的边界价格
+        body_low = o if o < c else c
+        body_high = c if o < c else o
 
-        right_idx = int((h - start_bin) / bin_size)
-        if right_idx < 0:
-            right_idx = 0
-        if right_idx >= num_bins:
-            right_idx = num_bins - 1
+        # 4. 执行核心比例锚定分配：实体权重70%，上影线15%，下影线15%
+        # (如果某根K线没有上/下影线，代码后方有安全因子自适应重对齐逻辑)
+        vol_body_total = final_weighted_vol * 0.70
+        vol_upper_total = final_weighted_vol * 0.15
+        vol_lower_total = final_weighted_vol * 0.15
 
-        if left_idx > right_idx:
-            left_idx, right_idx = right_idx, left_idx
+        # --- 第一层级：计算K线实体部分的筹码网格投射 ---
+        b_left_idx = int((body_low - start_bin) / bin_size)
+        b_right_idx = int((body_high - start_bin) / bin_size)
+        if b_left_idx < 0: b_left_idx = 0
+        if b_left_idx >= num_bins: b_left_idx = num_bins - 1
+        if b_right_idx < 0: b_right_idx = 0
+        if b_right_idx >= num_bins: b_right_idx = num_bins - 1
+        
+        body_bins_count = b_right_idx - b_left_idx + 1
+        fractional_body_vol = vol_body_total / float(body_bins_count)
+        for j in range(b_left_idx, b_right_idx + 1):
+            counts[j] += fractional_body_vol
 
-        crossed_bins_count = right_idx - left_idx + 1
-        # 将带有线性/半衰历史印记的成交量，概率化均匀铺在当前交易日所跨越的所有网格刻度中
-        fractional_vol = final_weighted_vol / float(crossed_bins_count)
+        # --- 第二层级：计算上影线部分的筹码网格投射 (body_high 至 h) ---
+        if h > body_high:
+            u_left_idx = int((body_high - start_bin) / bin_size)
+            u_right_idx = int((h - start_bin) / bin_size)
+            if u_left_idx < 0: u_left_idx = 0
+            if u_left_idx >= num_bins: u_left_idx = num_bins - 1
+            if u_right_idx < 0: u_right_idx = 0
+            if u_right_idx >= num_bins: u_right_idx = num_bins - 1
+            
+            upper_bins_count = u_right_idx - u_left_idx + 1
+            fractional_upper_vol = vol_upper_total / float(upper_bins_count)
+            for j in range(u_left_idx, u_right_idx + 1):
+                counts[j] += fractional_upper_vol
+        else:
+            # 如果没有上影线，将原本分配给上影线的量，反哺回K线实体
+            counts[b_left_idx:b_right_idx+1] += vol_upper_total / float(body_bins_count)
 
-        for j in range(left_idx, right_idx + 1):
-            counts[j] += fractional_vol
+        # --- 第三层级：计算下影线部分的筹码网格投射 (l 至 body_low) ---
+        if body_low > l:
+            d_left_idx = int((l - start_bin) / bin_size)
+            d_right_idx = int((body_low - start_bin) / bin_size)
+            if d_left_idx < 0: d_left_idx = 0
+            if d_left_idx >= num_bins: d_left_idx = num_bins - 1
+            if d_right_idx < 0: d_right_idx = 0
+            if d_right_idx >= num_bins: d_right_idx = num_bins - 1
+            
+            lower_bins_count = d_right_idx - d_left_idx + 1
+            fractional_lower_vol = vol_lower_total / float(lower_bins_count)
+            for j in range(d_left_idx, d_right_idx + 1):
+                counts[j] += fractional_lower_vol
+        else:
+            # 如果没有下影线，将原本分配给下影线的量，反哺回K线实体
+            counts[b_left_idx:b_right_idx+1] += vol_lower_total / float(body_bins_count)
 
     return counts
 
@@ -398,19 +435,18 @@ def _numba_compiled_composite_profile(
 def run_single_grid_calculation(
     df_period, target_dates_pool, atr_multiplier, base_atr, period_type="60日"
 ):
-    """【大周期多日大筹码核心组件 - V6.2 资管至尊完全体】
-
-    1. 完美修正：全链路重回 Numba 机器码内核，生吞 250日长周期矩阵，消除 Pandas 运行期内存碎片延迟。
-    2. 完美修正：网格分辨率空间自适应软收拢，当长周期振幅过大时自动收缩网格上限，保护 CPU 缓存命中，彻底封杀 OOM。
-    3. 完美修正：修正物理时间流逝权重，隔离脏日期带来的时间轴反向绞杀 Bug。
+    """【大周期多日大筹码核心组件 - V6.3 实体-影线自适应分配完全体】
+    
+    1. 完美集成：对接 V6.3 Numba 实体-影线分配内核，彻底解决长周期大振幅下的筹码稀释假量问题。
+    2. 完美防守：保留交易所 0.01元 Tick 刚性报价对齐与网格上限 3000 阶自适应软收拢机制，确保性能。
+    3. 时空修正：基于物理时间轴绝对对齐，离当前越近，权重执行严格的指数/线性正向递增。
     """
     try:
         if df_period.empty or len(df_period) < 2:
             return None
 
-        # 1. 🚨【核心修正：网格步长交易所对齐与空间自适应平滑】
+        # 1. 🚨【网格步长交易所对齐与空间自适应平滑】
         bin_size = float(base_atr * atr_multiplier)
-        # 强制网格步长对齐交易所 0.01元 硬性 Tick 步长，保证跨周期、跨多日看板可完美重叠叠加
         bin_size = np.round(bin_size / 0.01) * 0.01
         if bin_size < 0.01:
             bin_size = 0.01
@@ -420,39 +456,27 @@ def run_single_grid_calculation(
         global_low = float(df_period["Low"].min())
 
         if global_high == global_low:
-            return round(
-                np.round((global_high + global_low) / 2.0 / 0.01) * 0.01, 2
-            )
+            return round(np.round((global_high + global_low) / 2.0 / 0.01) * 0.01, 2)
 
         # 绝对零点整数倍网格对齐（预留 3倍 bin_size 缓冲）
-        start_bin = (
-            np.floor((global_low - bin_size * 3) / bin_size) * bin_size
-        )
+        start_bin = np.floor((global_low - bin_size * 3) / bin_size) * bin_size
         end_bin = np.ceil((global_high + bin_size * 3) / bin_size) * bin_size
 
-        # 🚨【核心修正：空间自适应软收拢机制 - 封杀高价股稀疏矩阵大爆炸】
+        # 🚨【空间自适应软收拢机制 - 封杀高价股稀疏矩阵大爆炸】
         num_bins = int(np.round((end_bin - start_bin) / bin_size))
-        # 工业最高上限设置为 3000。如果长周期振幅过宽导致 num_bins 暴涨打破 3000 阶，
-        # 说明网格切得过细，会引发内存碎片和二分法查找树性能雪崩。此时强行将步长翻倍，收拢矩阵维度！
         while num_bins > 3000:
             bin_size *= 2.0
-            start_bin = (
-                np.floor((global_low - bin_size * 3) / bin_size) * bin_size
-            )
-            end_bin = (
-                np.ceil((global_high + bin_size * 3) / bin_size) * bin_size
-            )
+            start_bin = np.floor((global_low - bin_size * 3) / bin_size) * bin_size
+            end_bin = np.ceil((global_high + bin_size * 3) / bin_size) * bin_size
             num_bins = int(np.round((end_bin - start_bin) / bin_size))
 
         if num_bins < 2:
-            return round(
-                np.round((global_high + global_low) / 2.0 / 0.01) * 0.01, 2
-            )
+            return round(np.round((global_high + global_low) / 2.0 / 0.01) * 0.01, 2)
 
         # 稳定生成多日复合网格刻度
         bins = np.linspace(start_bin, end_bin, num_bins + 1)
 
-        # 3. 日期池高速过滤（剥离一切昂贵的字符串匹配，转为高效的整型/原生时间戳匹配）
+        # 3. 日期池高速过滤
         df_sorted = df_period.copy()
         df_sorted["date_str"] = df_sorted["date_str"].astype(str)
         df_filter = (
@@ -466,21 +490,17 @@ def run_single_grid_calculation(
 
         total_days = len(df_filter)
 
-        # 4. 🚨【核心修正：基于物理时间轴绝对对齐的时间衰减矩阵】
-        # 确保序列正序下：索引越靠后（越接近现在），权重严格线性/指数递增
+        # 4. 🚨【基于物理时间轴绝对对齐的时间衰减矩阵】
         if "120日" in period_type or "250日" in period_type:
             half_life = max(2.0, float(total_days) / 2.0)
-            days_from_now = (
-                total_days - 1.0 - np.arange(total_days, dtype=np.float64)
-            )
+            days_from_now = total_days - 1.0 - np.arange(total_days, dtype=np.float64)
             raw_weights = np.exp(-np.log(2) * days_from_now / half_life)
             base_weights = 0.2 + 0.8 * raw_weights
         else:
             # 线性衰减严格正向递增
             base_weights = np.arange(1, total_days + 1, dtype=np.float64)
 
-        # 5. 🚨【核心修正：C-Contiguous 显式内存序列化重组 - 喂饱 Numba 内核】
-        # 将多天历史K线的 Open, High, Low, Close 展平成严格一维连续的 64位浮点内存快照
+        # 5. 🚨【C-Contiguous 显式内存序列化重组 - 喂饱 Numba 内核】
         prices_matrix = np.ascontiguousarray(
             df_filter[["Open", "High", "Low", "Close"]].to_numpy().flatten(),
             dtype=np.float64,
@@ -490,7 +510,7 @@ def run_single_grid_calculation(
         )
         weights_matrix = np.ascontiguousarray(base_weights, dtype=np.float64)
 
-        # 🚨 调用绝对寻址安全的大周期 JIT 内核，生吞多日矩阵
+        # 🚨【核心修改点】：替换调用绝对寻址安全的 V6.3 实体-影线自适应分配大周期 JIT 内核
         combined_counts = _numba_compiled_composite_profile(
             prices_matrix,
             volumes_matrix,
@@ -502,17 +522,13 @@ def run_single_grid_calculation(
 
         # 6. 执行直方图最高峰扫描
         if combined_counts.sum() == 0:
-            return round(
-                np.round((global_high + global_low) / 2.0 / 0.01) * 0.01, 2
-            )
+            return round(np.round((global_high + global_low) / 2.0 / 0.01) * 0.01, 2)
 
         max_idx = np.argmax(combined_counts)
 
         # 边界安全性越界过筛
         if max_idx >= len(combined_counts) or (max_idx + 1) > num_bins:
-            return round(
-                np.round((global_high + global_low) / 2.0 / 0.01) * 0.01, 2
-            )
+            return round(np.round((global_high + global_low) / 2.0 / 0.01) * 0.01, 2)
 
         # 🚨【显式采信真实切片边界】
         bins_edge_left = bins[max_idx]
@@ -525,8 +541,9 @@ def run_single_grid_calculation(
         return round(float(final_compliant_price), 2)
 
     except Exception as e:
-        print(f" 🚨 大周期组件 run_single_grid_calculation 异常: {e}")
+        print(f" 🚨 大周期组件 V6.3 运行异常: {e}")
         return None
+        
         
 
 # =========================================================================
