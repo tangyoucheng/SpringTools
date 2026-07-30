@@ -172,9 +172,9 @@ if __name__ == "__main__":
     for d_str in days_7:
         execute_strategic_interceptor_v2_4(d_str, "长进光子", is_index_weight=True)
 
-    #print("\n" + "="*73)
+    print("\n", "=" * 73, sep="")
     print(" 📊 08月份 衍生品全量时间轴流水账前瞻 (提早为您圈定下个月的所有可买日期)")
-    #print(" "="*73)
+    print("=" * 73)
     
     # 精准生成 8 月份一整个月所有国内法定交易日的时间轴，交给决策树自动判断分类
     start_date = datetime.date(2026, 8, 1)
