@@ -31,6 +31,7 @@ from cdp_poc_total_ATR import execute_all_period_pipeline
 from common_atr import fetch_dynamic_atr
 from common_Actual_Date_info import get_stock_metrics_by_calendar
 from common_number import RoundingStyle
+from common_yfinance import clean_and_standardize_sh_sz_data
     
 
   
@@ -48,8 +49,9 @@ if __name__ == "__main__":
     stocks_list = []
     profit_margin_pool = [] #利润率
     
-    # 1. 设定你想作为第一个开始的股票代码
-    start_stock = "688806"
+    # 1. 设定你想作为第一个开始的股票代码 ###############
+    #start_stock = "688085"
+    start_stock = ""
     # 2. 将字典所有的 key 转换成纯列表
     all_keys = list(stock_dict.keys())
     # 3. 找到这只股票在列表中的位置，并切片截取它后面的所有代码
@@ -60,6 +62,8 @@ if __name__ == "__main__":
     else:
         print(f"[-] 提示：指定的起始股票 {start_stock} 不在字典中，默认从头开始。")
         target_stocks = all_keys        
+
+    CHOSEN_END_DATE = OUTPUT_END_DATE 
     for stock_code in target_stocks:
     
     #全部读取的场合
@@ -70,6 +74,11 @@ if __name__ == "__main__":
         stock_code = str(stock_code)   
 
         target_stock, board_name = detect_stock_board_and_suffix(stock_code)
+        # 🚨 完美写法：如果板块名称不在这个指定的“双创”池子里，直接跳过
+        #if board_name not in ("科创板", "创业板"):
+        #if board_name not in ("沪市主板", "深市主板"):
+        #    continue
+            
         stock_name = stock_dict.get(
             stock_code,
             "未知股票"
@@ -147,6 +156,8 @@ if __name__ == "__main__":
         # 2. 抓取多日大周期历史日线数据
         print(f"📡 正在调取 【{target_stock} {stock_name}】 交易所底仓K线流数据...")
         df_daily_raw = yf.download(target_stock, start=start_date_past, end=download_end_dt, interval="1d", progress=False, auto_adjust=True, group_by='ticker', session=session)
+        # 🚨 接入“抗毒”清洗器（直接覆盖）
+        df_daily_raw = clean_and_standardize_sh_sz_data(df_daily_raw)
         
         if df_daily_raw.empty:
             print(f"🚨 错误：未能获取到历史日K线数据，请检查网络或更换标的代码！")
@@ -196,9 +207,11 @@ if __name__ == "__main__":
         else:
             # 实时最新情况，下载当前最新一天的 1分钟 分时
             df_intraday_raw = yf.download(target_stock, period="1d", interval="1m", progress=False, auto_adjust=True, group_by='ticker', session=session)
+        # 🚨 接入“抗毒”清洗器（直接覆盖）
+        df_intraday_raw = clean_and_standardize_sh_sz_data(df_intraday_raw)
         
-        if isinstance(df_intraday_raw.columns, pd.MultiIndex):
-            df_intraday_raw.columns = df_intraday_raw.columns.get_level_values(-1)
+        #if isinstance(df_intraday_raw.columns, pd.MultiIndex):
+        #    df_intraday_raw.columns = df_intraday_raw.columns.get_level_values(-1)
         
         # 【安全防御网】万一 yfinance 因为历史久远查不到当天的 1M 分时图，自动执行单日降维模拟，防引擎崩溃
         if df_intraday_raw.empty:
