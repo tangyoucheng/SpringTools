@@ -249,16 +249,13 @@ if __name__ == "__main__":
         for days in periods_pool:
             if days == 1:
                 # 1天短线单日分时：传入对应分时表格，日期池传空，并实时透传用户指定的截止时间
-                print(f" 彻底修复清洗系数倒挂、彻底封杀 raw_low 百分比max截断导致的指标伪共振盲区")
                 results_board[days] = execute_all_period_pipeline(
                     target_stock, df_intraday_raw, [], df_period_days=1, base_price=fallback_base_price, end_date_str=CHOSEN_END_DATE, base_atr=base_atr_14
                 )
             else:
                 # 多日宏观大周期：截取对应天数的日K线切片传入
                 df_slice = df_daily_raw.iloc[-days:]
-                sub_dates_pool = df_slice["date_str"].tolist()
-                
-                print(f" 彻底修复清洗系数倒挂、彻底封杀 raw_low 百分比max截断导致的指标伪共振盲区")
+                sub_dates_pool = df_slice["date_str"].tolist()                
                 results_board[days] = execute_all_period_pipeline(
                     target_stock, df_slice, sub_dates_pool, df_period_days=days, base_price=fallback_base_price, end_date_str=CHOSEN_END_DATE, base_atr=base_atr_14
                 )
