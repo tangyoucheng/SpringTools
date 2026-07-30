@@ -546,7 +546,7 @@ def execute_all_period_pipeline(ticker_symbol, df_all_data, target_dates_pool, d
     （彻底修复清洗系数倒挂、彻底封杀 raw_low 百分比max截断导致的指标伪共振盲区）
     """
     try:
-        print(f" 彻底修复清洗系数倒挂、彻底封杀 raw_low 百分比max截断导致的指标伪共振盲区new")
+        print(f" 计算反弹阻力")
         df_period_days = int(df_period_days)
         df_window = df_all_data.tail(df_period_days) if df_period_days > 1 else df_all_data
 
