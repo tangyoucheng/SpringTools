@@ -1,12 +1,24 @@
+#common_settlement_date.py
+#交割日计算
+
 import datetime
 
 # 🚨 【工业级刚性防火墙】：每年年底只需手动更新一次次年的中国休市调休脏日期（2026-2027年真实/模拟对齐）
 # 仅需录入【原本是周一到周五但因为法定长假休市】的脏日期，周末补班股市不开盘无需录入，代码会自动过滤。
 CHINESE_MARKET_HOLIDAYS = {
+    "2026-09-25",
     "2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07",
     "2027-01-26", "2027-01-27", "2027-01-28", "2027-01-29",
     "2027-10-01", "2027-10-04", "2027-10-05", "2027-10-06"
 }
+
+# 🚨 【资管级物理全局内存缓存池】：彻底封杀重复矩阵计算，消除算法套娃引发的崩溃隐患
+_CALENDAR_CACHE = {}
+
+def get_weekday_cn(date_obj):
+    """辅助函数：将英文星期转换为直观的中文星期"""
+    week_dict = {0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}
+    return week_dict[date_obj.weekday()]
 
 def get_next_trading_day_v2_4(start_date):
     """【核心管道辅助】：计算指定日期之后的第一个真实国内交易日（下周一冲锋期校准）"""
@@ -15,11 +27,28 @@ def get_next_trading_day_v2_4(start_date):
         curr += datetime.timedelta(days=1)
     return curr
 
+def check_date_is_pure_safe_green(check_date):
+    """【核心过滤器插件】：判断指定交易日是否属于无任何衍生品枷锁压制的 纯净绿色安全期"""
+    cal_check = calculate_strict_tactical_calendar_v2_4(check_date.year, check_date.month)
+    
+    is_cffex_freeze = check_date == cal_check["CFFEX"]["settlement_day"]
+    is_opt_freeze = check_date == cal_check["OPTIONS"]["settlement_day"]
+    is_me_freeze = check_date in cal_check["MONTH_END"]["settlement_days"]
+    
+    # 🚨【去噪并集重构】：由于禁买期被彻底切除，现在只要这一天不是三大品种的交割日，就属于绿色安全期
+    if not (is_cffex_freeze or is_opt_freeze or is_me_freeze):
+        return True
+    return False
+
 def calculate_strict_tactical_calendar_v2_4(year, month):
     """【十六字军规4路合围终极自校准矩阵 - V2.4 终极完全体】
     
     100% 独立离线计算，精准锁定中国资产四大核心衍生品交割/结算/行权周期的生死边界。
     """
+    cache_key = (year, month)
+    if cache_key in _CALENDAR_CACHE:
+        return _CALENDAR_CACHE[cache_key]
+
     first_day = datetime.date(year, month, 1)
     w_first = first_day.weekday()
     
@@ -81,9 +110,6 @@ def calculate_strict_tactical_calendar_v2_4(year, month):
             work_days.append(curr_day)
         curr_day -= datetime.timedelta(days=1)
         
-    # 🚨【核心Bug修正】：work_days 是按时间倒序排列的
-    # work_days[0] 是全月最后一天（倒数第一交易日 -> 雪球观察日）
-    # work_days[1] 是倒数第二交易日（-> 新加坡A50/港股期指结算日）
     sgx_a50_settlement = work_days[1]      
     snowball_observation = work_days[0]    
     
@@ -91,7 +117,7 @@ def calculate_strict_tactical_calendar_v2_4(year, month):
     monthend_no_buy_end = sgx_a50_settlement - datetime.timedelta(days=1)
     monthend_go_day = get_next_trading_day_v2_4(snowball_observation)
 
-    return {
+    res_calendar = {
         "CFFEX": {
             "no_buy_zone": (cffex_no_buy_start, cffex_no_buy_end),
             "settlement_day": cffex_settlement,
@@ -108,93 +134,87 @@ def calculate_strict_tactical_calendar_v2_4(year, month):
             "go_day": monthend_go_day
         }
     }
+    
+    _CALENDAR_CACHE[cache_key] = res_calendar
+    return res_calendar
 
 def execute_strategic_interceptor_v2_4(target_date_str, stock_name, is_index_weight=False):
-    """【十六字军规机器强拦截器 - V2.4 零误差完全体】
-    
-    参数说明:
-    - target_date_str: 待审计的目标交易日期，字符串格式如 '2026-07-30'
-    - stock_name: 待审计股票的名称，如 '长进光子'
-    - is_index_weight: 🚨【4. 个股特征判定开关】：是否属于期指权重股或高波震荡股
-                      - 传入 True (如长进光子、天承科技、科威尔)：表明该股属于各大期指/期权核心成分股，
-                        交割前夕会被多空大资金当作操纵指数获利的无脑砸盘工具。红线期一律触发红色强制锁仓禁买。
-                      - 传入 False (如工大高科、宜安科技)：表明该股已通过上游Python管道清洗，不属于期指
-                        权重，天然具备衍生品风暴免疫力，红线期自动降级放行，允许轻仓配置防守型标的Facts。
-    """
+    """【十六字军规机器强拦截器 - V2.4 三色球去噪纯净版】"""
     t_date = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
     cal = calculate_strict_tactical_calendar_v2_4(t_date.year, t_date.month)
     
-    print(f"\n[📡 终极审计] 交易日期: {target_date_str} | 标的: {stock_name}")
+    day_str = t_date.strftime('%m月%d日')
+    week_str = get_weekday_cn(t_date)
     
-    # 精准区间匹配
-    is_cffex_nobuy = cal["CFFEX"]["no_buy_zone"][0] <= t_date <= cal["CFFEX"]["no_buy_zone"][1]
+    # 判定矩阵
+    is_holiday = str(t_date) in CHINESE_MARKET_HOLIDAYS
     is_cffex_freeze = t_date == cal["CFFEX"]["settlement_day"]
-    is_cffex_go = t_date == cal["CFFEX"]["go_day"]
-    
-    is_opt_nobuy = cal["OPTIONS"]["no_buy_zone"][0] <= t_date <= cal["OPTIONS"]["no_buy_zone"][1]
     is_opt_freeze = t_date == cal["OPTIONS"]["settlement_day"]
-    is_opt_go = t_date == cal["OPTIONS"]["go_day"]
-    
-    is_me_nobuy = cal["MONTH_END"]["no_buy_zone"][0] <= t_date <= cal["MONTH_END"]["no_buy_zone"][1]
     is_me_freeze = t_date in cal["MONTH_END"]["settlement_days"]
-    is_me_go = t_date == cal["MONTH_END"]["go_day"]
 
-    # 🚨【风控最高层级并集阻断决策树】：全面解决多周期重叠导致的“红绿灯同时亮起”指令冲突错误
-    # 只要命中了任何一个品种的承压期，且个股判定开关为True，【前3天不买】红灯即刻获得绝对一票否决权
-    if (is_cffex_nobuy or is_opt_nobuy or is_me_nobuy) and is_index_weight:
-        print(f" 🚨【前3天不买】：强制风控拦截！当前处于交割前夜主力前置换月打压期。")
-        print(f"   * 行为提示：由于 is_index_weight=True 触发，该股极易被空头当作流动性提款机，强行锁仓禁买。")
-    # 只要处于交割行权当日，多空进行最终现货仓位平仓对倒，执行【交割日不动】
+    # 🚨【终极纯净决策树】：剔除全部禁买提示，强行向三色球归拢
+    # 1. 🟠 优先拦截：指定国家法定假期休市日
+    if is_holiday:
+        print(f" 🟠 {day_str} ({week_str})  ──> 🟠 国家法定长假调休期间 (交易所闭盘休市，资金面冻结)")
+        
+    # 2. 🛑 最高特权：交割大考日当天分支
     elif is_cffex_freeze or is_opt_freeze or is_me_freeze:
-        print(f" 🛑【交割日不动】：终局行权决战日！操作纪律：【不割肉、不盲目加仓】。")
-        print(f"   * 行为提示：尾盘14:30后空头面临最后法定行权平仓，在此之前盘中任何极速跳水都是最后的洗盘施压。")
-    # 只有当本月所有的交割红线全部踩完、场内利空出清，且属于非高危期间，才触发【下周一再冲】
-    elif is_cffex_go or is_opt_go or is_me_go:
-        print(f" ⚡【下周一再冲】：利空全面出清，十六字军规战略反击点触发！")
-        print(f"   * 行为提示：全盘衍生品枷锁已经落地平仓。市场重复苏个股 Current Facts 核心中报业绩定价权。")
+        next_trading_day = get_next_trading_day_v2_4(t_date)
+        is_next_day_pure_green = check_date_is_pure_safe_green(next_trading_day)
+        
+        if is_cffex_freeze:
+            print(f" 🛑 {day_str} ({week_str})  ──> 🛑 中金所主力合约结算交割日 (现货总交锋，坚决不动)")
+            if is_next_day_pure_green:
+                print(f"    💡 这里的{day_str}14:30 - 15:00是买廉价筹码的最好时间")
+        elif is_opt_freeze:
+            print(f" 🛑 {day_str} ({week_str})  ──> 🛑 场内期权最终行权到期日 (现货总交锋，坚决不动)")
+            if is_next_day_pure_green:
+                print(f"    💡 这里的{day_str}14:30 - 15:00是买廉价筹码的最好时机")
+        elif t_date == cal["MONTH_END"]["settlement_days"][0]:  # 倒数第二交易日 (A50交割)
+            print(f" 🛑 {day_str} ({week_str})  ──> 🛑 新加坡A50期指/港股期指最终交割日 (现货总交锋，坚决不动)")
+        elif t_date == cal["MONTH_END"]["settlement_days"][1]:  # 倒数第一交易日 (雪球观察)
+            print(f" 🛑 {day_str} ({week_str})  ──> 🛑 私募雪球/气囊产品月末集中观察日 (现货总交锋，坚决不动)")
+            if is_next_day_pure_green:
+                print(f"    💡 这里的{day_str}14:30 - 15:00是买廉价筹码的最好时间")
+                
+    # 3. 🟢 常规放行：无交割枷锁的纯净安全期（禁买期已被完全清洗、合并至此）
     else:
-        print(f" 🟢 常规安全期：无衍生品周期压制，正常根据 V6.3 静态筹码墙执行高抛低吸。")
+        print(f" 🟢 {day_str} ({week_str})  ──> 🟢 没有任何衍生品枷锁，属于安全反击冲锋期 (饱满开火/常规采用V6.3筹码墙)")
 
-# =========================================================================
-# ⚙️ 2026年下半年【4路全量无误差反击日历】最终想定演审 (完全格式化提纯版)
-# =========================================================================
+
+
+
 if __name__ == "__main__":
-    print("=========================================================================")
-    print("     🛡️ 十六字军规最终完全体：2026下半年【四路交割大考与反击具体日期】")
-    print("=========================================================================")
+    #print("=========================================================================")
+    #print(" 📊 07月份 衍生品流水账时间轴矩阵 (V2.4 终极完美修正时间轴版)")
+    #print("=========================================================================")
     
-    months = [7, 8, 9, 10, 11, 12]
-    for m in months:
-        c = calculate_strict_tactical_calendar_v2_4(2026, m)
-        
-        # 🚨【核心可读性格式化提取】：强行剥离元组内的 datetime.date 机器格式，提纯为 YYYY-MM-DD 干净字符串
-        cffex_start = c['CFFEX']['no_buy_zone'][0].strftime('%Y-%m-%d')
-        cffex_end = c['CFFEX']['no_buy_zone'][1].strftime('%Y-%m-%d')
-        cffex_settle = c['CFFEX']['settlement_day'].strftime('%Y-%m-%d')
-        cffex_go = c['CFFEX']['go_day'].strftime('%Y-%m-%d')
-        
-        opt_start = c['OPTIONS']['no_buy_zone'][0].strftime('%Y-%m-%d')
-        opt_end = c['OPTIONS']['no_buy_zone'][1].strftime('%Y-%m-%d')
-        opt_settle = c['OPTIONS']['settlement_day'].strftime('%Y-%m-%d')
-        opt_go = c['OPTIONS']['go_day'].strftime('%Y-%m-%d')
-        
-        me_start = c['MONTH_END']['no_buy_zone'][0].strftime('%Y-%m-%d')
-        me_end = c['MONTH_END']['no_buy_zone'][1].strftime('%Y-%m-%d')
-        me_settle_a50 = c['MONTH_END']['settlement_days'][0].strftime('%Y-%m-%d')  # 倒数第二交易日 Facts
-        me_settle_snow = c['MONTH_END']['settlement_days'][1].strftime('%Y-%m-%d') # 倒数第一交易日 Facts
-        me_go = c['MONTH_END']['go_day'].strftime('%Y-%m-%d')
-        
-        print(f"\n📅 【2026年{str(m).zfill(2)}月 终极闭环日历】:")
-        print(f"   [中金所期指大考] -> 🚫 前3天不买: ({cffex_start} 至 {cffex_end})  🛑 交割日不动: {cffex_settle}  ⚡ 下周一再冲: {cffex_go}")
-        print(f"   [交易所期权大考] -> 🚫 前2天不买: ({opt_start} 至 {opt_end})  🛑 交割日不动: {opt_settle}  ⚡ 下周一再冲: {opt_go}")
-        print(f"   [月末联合大考]   -> 🚫 前3天不买: ({me_start} 至 {me_end})  🛑 交割日不动: ({me_settle_a50}, {me_settle_snow})  ⚡ 下周一再冲: {me_go}")
-
-    print("\n" + "="*73)
-    print("               🔬 7月终局极限压力测试（物理时空完全对齐）")
-    print("="*73)
-    # 精准复盘今天7月30日（周四）
-    execute_strategic_interceptor_v2_4("2026-07-30", "长进光子", is_index_weight=True)
-    # 精准复盘明天7月31日（周五大考结算日）
-    execute_strategic_interceptor_v2_4("2026-07-31", "长进光子", is_index_weight=True)
-    # 精准前瞻下周一8月3日（利空出清反击首日）
-    execute_strategic_interceptor_v2_4("2026-08-03", "长进光子", is_index_weight=True)
+    #days_7 = ["2026-07-14", "2026-07-15", "2026-07-16", "2026-07-17", 
+    #          "2026-07-20", "2026-07-21", "2026-07-22", "2026-07-23", 
+    #          "2026-07-24", "2026-07-27", "2026-07-28", "2026-07-29", 
+    #          "2026-07-30", "2026-07-31"]
+    #for d_str in days_7:
+    #    execute_strategic_interceptor_v2_4(d_str, "长进光子", is_index_weight=True)
+    #
+    #print("\n", "=" * 73, sep="")
+    #print(" 📊 08月份 衍生品全量时间轴流水账前瞻 (提早为您圈定下个月的所有可买日期)")
+    #print("="*73)
+    
+    # 模拟8月1日至8月24日（包含第一个安全日）的全量时间轴生成
+    #start_date = datetime.date(2026, 7, 31)
+    start_date = datetime.date.today()
+    end_date = datetime.date(2027, 10, 31)
+    curr = start_date
+    # 初始化一个变量，用于追踪上一次执行函数时的月份
+    last_executed_month = None
+    while curr <= end_date:
+        if curr.weekday() < 5:
+            # 核心判断：如果当前月份与上一次执行的月份不同，则打印矩阵大标题
+            current_month_str = curr.strftime('%Y-%m')
+            if last_executed_month != current_month_str:
+                print("=========================================================================")
+                print(f" 📊 {curr.strftime('%Y-%m')}月份 衍生品流水账时间轴矩阵 (起点：{curr.strftime('%Y-%m-%d')}) ")
+                print("=========================================================================")
+                last_executed_month = current_month_str # 更新记录
+            execute_strategic_interceptor_v2_4(curr.strftime('%Y-%m-%d'), "长进光子", is_index_weight=True)
+        curr += datetime.timedelta(days=1)
