@@ -14,5 +14,5 @@ TABLES_CONFIG = [
     {
         "TABLE_NAME": "TCMMTHOJO",
         "BUSINESS_PKS": ["CDCMP", "KBMST", "CDCODE"]
-    }
+    },
 ]
