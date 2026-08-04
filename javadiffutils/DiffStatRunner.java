@@ -51,8 +51,8 @@ public class DiffStatRunner {
     	extensions.add(".yml");
 
     	extensions.add(".cs");
-    	extensions.add(".Designer");
-    	extensions.add(".Designer.cs");
+//    	extensions.add(".Designer");
+//    	extensions.add(".Designer.cs");
     	extensions.add(".csproj");
 
 		String outputDir = "output.DiffStat"; // 存放EXCEL报告的目录
@@ -104,17 +104,23 @@ public class DiffStatRunner {
 
                 try {
                     if (oldFile != null && newFile != null) {
-                    	int firstDot = newFile.getName().indexOf(".");
-                    	String multiExt = newFile.getName().substring(firstDot + 1);
-                    	String[] parts = multiExt.split("\\.", 2);
-                    	if ("Fisshplate".equals(parts[0])) {
-                    		info.type = "csproj";
-						} else if ("Designer".equals(parts[0])) {
-							info.type = "cs";
+//                    	int firstDot = newFile.getName().indexOf(".");
+//                    	String multiExt = newFile.getName().substring(firstDot + 1);
+//                    	String[] parts = multiExt.split("\\.", 2);
+//                    	if ("Fisshplate".equals(parts[0])) {
+//                    		info.type = "csproj";
+//						} else if ("Designer".equals(parts[0])) {
+//							info.type = "cs";
+//						} else {
+//							info.type = parts[0];
+//						}
+						String ext = FileUtils.getExtension(newFile.getName());
+						if (("dev".equals(ext) && newFile.getName().endsWith("xml.dev"))
+								|| ("rel".equals(ext) && newFile.getName().endsWith("xml.rel"))) {
+							info.type = "xml";
 						} else {
-							info.type = parts[0];
+							info.type = ext;
 						}
-//                    	info.type = FileUtils.getExtension(newFile.getName());
 
                         // 【变更/未变】
                     	System.out.println(oldFile.toPath());
@@ -313,11 +319,11 @@ public class DiffStatRunner {
 
 
     private static void countBeforeLinesByExtension(FileInfo info, File file, List<String> lines) {
-        String ext = getMainType(file);
+        String ext = FileUtils.getExtension(file.getName());
 
         // 简单的策略模式
         switch (ext) {
-            case "java": case "cpp": case "c": case "cs": case "Designer": case "js": case "ts":
+            case "java": case "cpp": case "c": case "cs": case "js": case "ts":
                 countBeforeByRules(info,lines, "//", "/*", "*/");
                 break;
             case "xml": case "html": case "csproj":
@@ -360,12 +366,12 @@ public class DiffStatRunner {
     }
 
     private static void countAfterLinesByExtension(FileInfo info, File file, List<String> lines) {
-//        String ext = FileUtils.getExtension(fileName);
-        String ext = getMainType(file);
+        String ext = FileUtils.getExtension(file.getName());
+//        String ext = getMainType(file);
 
         // 简单的策略模式
         switch (ext) {
-            case "java": case "cpp": case "c": case "cs": case "Designer": case "js": case "ts":
+            case "java": case "cpp": case "c": case "cs": case "js": case "ts":
             	countAfterByRules(info,lines, "//", "/*", "*/");
                 break;
             case "xml": case "html": case "csproj":
@@ -446,19 +452,5 @@ public class DiffStatRunner {
 		}
 	}
 
-	public static String getMainType(File newFile) {
-	    String name = newFile.getName();
-
-	    int firstDot = name.indexOf(".");
-	    if (firstDot == -1 || firstDot == name.length() - 1) {
-	        return ""; // 没有扩展名
-	    }
-
-	    String multiExt = name.substring(firstDot + 1);
-
-	    String[] parts = multiExt.split("\\.", 2);
-
-	    return parts.length > 0 ? parts[0] : "";
-	}
 }
 
