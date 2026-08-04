@@ -7,41 +7,9 @@ from sqlalchemy import create_engine, text
 from openpyxl.styles import PatternFill
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common_oracle_config import URL_OLD, URL_NEW
+from common_oracle_config import engine_old, engine_new
 from common_oracle_meta import get_oracle_meta
-
-# SQLAlchemy の Engine オブジェクトを作成（これで UserWarning が完全に消えます）
-engine_old = create_engine(URL_OLD)
-engine_new = create_engine(URL_NEW)
-
-# 対象のテーブル名（Oracleはデフォルト大文字のため、必ず大文字で指定）
-#TABLE_NAME = "TCMMSGINFO" 
-TABLE_NAME = "TCMMTHOJO" 
-# 【重要】業務主キーを指定（単一、または複合主キーのリスト）
-# 例1（単一カラム）: BUSINESS_PKS = ["ORDER_NO"]
-# 例2（複合カラム）: BUSINESS_PKS = ["USER_ID", "PRODUCT_ID"]
-#BUSINESS_PKS = ["SQSEQ"] 
-BUSINESS_PKS = ["CDCMP", "KBMST", "CDCODE"]
-# 範囲検索（BETWEEN）に使用する基準カラム（通常は上記の主キーのいずれか1つを指定）
-#RANGE_COL = "SQSEQ"
-RANGE_COL = "CDCMP"
-# ==================== ★ 比較対象の複数テーブル設定 ★ ====================
-# ここに対象のテーブル、業務主キーのリストをすべて定義します。
-# 何表あっても、ここに追記するだけで自動で順番に処理されます。
-#
-# 【重要】業務主キーを指定（単一、または複合主キーのリスト）
-# 例1（単一カラム）: BUSINESS_PKS = ["ORDER_NO"]
-# 例2（複合カラム）: BUSINESS_PKS = ["USER_ID", "PRODUCT_ID"]
-TABLES_CONFIG = [
-    {
-        "TABLE_NAME": "TCMMSGINFO",
-        "BUSINESS_PKS": ["SQSEQ"]
-    },
-    {
-        "TABLE_NAME": "TCMMTHOJO",
-        "BUSINESS_PKS": ["CDCMP", "KBMST", "CDCODE"]
-    }
-]
+from common_oracle_table_config import TABLES_CONFIG
 
 # ==================== ★ Excel出力の配置設定 ★ ====================
 # Excelの出力開始位置を指定します（0から始まるインデックス）
