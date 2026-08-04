@@ -3,6 +3,7 @@ import sys
 import pandas as pd
 import oracledb
 import math
+from datetime import datetime
 from sqlalchemy import create_engine, text
 from openpyxl.styles import PatternFill
 
@@ -22,18 +23,24 @@ START_COL = 1
 def execute_compare_for_table(target_config):
     table_name = target_config["TABLE_NAME"]
     business_pks = target_config["BUSINESS_PKS"]
+    extra_where = target_config.get("EXTRA_WHERE", "")
     
     print(f"\n==================================================")
-    print(f" テーブル 【{table_name}】 の比較処理を開始します...")
+    print(f" テーブル 【{table_name}】 の比較处理を開始します...")
+    if extra_where:
+        print(f" [抽出条件指定]: WHERE {extra_where}")
     print(f"==================================================")
     
     print("Oracleのテーブル定義と論理名（コメント）を取得中...")
     type_dict, comment_dict = get_oracle_meta(engine_new, table_name)
     
-    # 複合キーと単一キーの双方で安全に動作するハッシュ関数用の文字列表現を作成
     pk_concat_str = " || ',' || ".join(business_pks)
     
-    # ORA_HASHを用いてデータを100個のバケットに均等分割（千万級データ対応）
+    # ★抽出条件（EXTRA_WHERE）がある場合、SQLのWHERE句を動的に組み立て
+    condition_clause = ""
+    if extra_where and extra_where.strip() != "":
+        condition_clause = f" AND ({extra_where}) "
+    
     total_chunks = 100  
     all_diff_rows = []
     diff_cells_coord = []
@@ -43,10 +50,11 @@ def execute_compare_for_table(target_config):
     with engine_old.connect() as conn_old, engine_new.connect() as conn_new:
         for bucket_id in range(total_chunks):
             
-            # 新環境からバケットに該当するデータを取得
+            # 抽出条件（condition_clause）を後ろに結合
             sql_new = f"""
                 SELECT * FROM {table_name}
                 WHERE ORA_HASH({pk_concat_str}, {total_chunks - 1}) = :bucket_id
+                {condition_clause}
                 ORDER BY {', '.join(business_pks)}
             """
             df_new = pd.read_sql_query(text(sql_new), conn_new, params={"bucket_id": bucket_id})
@@ -55,16 +63,15 @@ def execute_compare_for_table(target_config):
             if df_new.empty:
                 continue
                 
-            # 旧环境也同步读取相同哈希桶内的数据，确保数据范围完全对称一致
             sql_old = f"""
                 SELECT * FROM {table_name}
                 WHERE ORA_HASH({pk_concat_str}, {total_chunks - 1}) = :bucket_id
+                {condition_clause}
                 ORDER BY {', '.join(business_pks)}
             """
             df_old = pd.read_sql_query(text(sql_old), conn_old, params={"bucket_id": bucket_id})
             df_old.columns = df_old.columns.str.upper()
 
-            # 業務主キーをインデックスに設定
             df_new.set_index(business_pks, inplace=True)
             df_old.set_index(business_pks, inplace=True)
             
@@ -81,7 +88,6 @@ def execute_compare_for_table(target_config):
                 
                 if not row_old.fillna('').equals(row_new.fillna('')):
                     
-                    # 最初の1回目のみ、最上部にフィールド英名とデータ型を出力
                     if is_first_diff:
                         # 1行目：フィールド物理名
                         row_eng = {col: col for col in sub_old.columns}
@@ -104,18 +110,17 @@ def execute_compare_for_table(target_config):
                     row_new_data['比較タイプ'] = '新データ (NEW)'
                     row_old_data['比較タイプ'] = '旧データ (OLD)'
                     
-                    # 【型エラー・複数キー完全対応版】
-                    # 単一キー（文字列）と複合キー（タプル）を判定して安全にマッピング
                     if len(business_pks) == 1:
-                        pk_key = business_pks[0]
-                        row_new_data[pk_key] = idx
-                        row_old_data[pk_key] = idx
+                        # 単一キーの場合：リストから文字列（例: 'SQSEQ'）を取り出してキーにする
+                        pk_str = business_pks[0]
+                        row_new_data[pk_str] = idx
+                        row_old_data[pk_str] = idx
                     else:
+                        # 複合キーの場合：idxはタプルなので、それぞれ展開してキーにする
                         for k, v in zip(business_pks, idx):
                             row_new_data[k] = v
                             row_old_data[k] = v
                     
-                    # 差分セルの座標記録
                     new_row_pos = current_row_idx  
                     for col in sub_old.columns:
                         val_old = str(row_old[col]).strip() if pd.notnull(row_old[col]) else ''
@@ -129,8 +134,8 @@ def execute_compare_for_table(target_config):
                     
                     current_row_idx += 3  
                     
-            if (bucket_id + 1) % 10 == 0:
-                print(f"進捗: 進捗ブロック {bucket_id + 1} / {total_chunks} の比較が完了...")
+            if (bucket_id + 1) % 20 == 0:
+                print(f"進捗: バケット {bucket_id + 1} / {total_chunks} の比較が完了...")
                 
     # ==================== 4. Excelファイルへの出力と色付け調整 ====================
     if all_diff_rows:
@@ -146,7 +151,8 @@ def execute_compare_for_table(target_config):
         original_cols = list(result_df.columns)
         result_df.rename(columns=display_comment_dict, inplace=True)
         
-        output_file = f"{table_name}_diff_result.xlsx"
+        current_time = datetime.now().strftime("%Y%m%d_%H%M")
+        output_file = f"{table_name}_diff_result_{current_time}.xlsx"
         
         with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
             result_df.to_excel(writer, index=False, sheet_name='Data_Diff', startrow=START_ROW, startcol=START_COL)
