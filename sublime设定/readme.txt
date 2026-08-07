@@ -24,3 +24,16 @@
     { "keys": ["shift+alt+up"], "command": "select_lines", "args": {"forward": false} },
     { "keys": ["shift+alt+down"], "command": "select_lines", "args": {"forward": true} }
 ]
+
+3步汉化操作指南
+1打开命令面板
+  Windows / Linux 用户：按下快捷键 Ctrl + Shift + P。
+  Mac 用户：按下快捷键 Cmd + Shift + P。
+2安装包管理器（如果已经安装过，请跳过此步）
+  在弹出的输入框中输入 Install Package Control，看到同名选项后回车。
+  等待几秒钟，系统提示安装成功后点击“OK”。
+3安装中文语言包
+  再次按下 Ctrl + Shift + P（或 Cmd + Shift + P）。
+  输入 Install Package，选中 Package Control: Install Package 并回车。
+  在新出现的输入框中输入 ChineseLocalizations，选中这个插件并回车。
+
