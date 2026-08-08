@@ -10,7 +10,9 @@ import time
 import os
 import threading
 import atexit
+import random
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # 1. 获取当前目录和父目录的绝对路径
@@ -96,29 +98,50 @@ def _query_baostock(bs_code: str, start_date: str, end_date: str,
                 adjustflag=adjustflag
             )
         except Exception as e:
-            print(f"⚠️ 查询过程异常: {e}，重置连接重试 ({attempt+1}/{MAX_RETRIES})")
+            # 捕获所有异常，包括 UnicodeDecodeError
+            print(f"⚠️ 查询过程异常 ({type(e).__name__}): {e}，重置连接重试 ({attempt+1}/{MAX_RETRIES})")
             _BS_READY = False
             if attempt == MAX_RETRIES - 1:
                 return pd.DataFrame()
             time.sleep(1)
             continue
 
-        if rs.error_code != '0':
-            if "网络" in rs.error_msg or "接收" in rs.error_msg or "连接" in rs.error_msg:
-                print(f"⚠️ 网络错误: {rs.error_msg}，重置重试 ({attempt+1}/{MAX_RETRIES})")
-                _BS_READY = False
-                if attempt == MAX_RETRIES - 1:
-                    print(f"❌ 最终失败: {rs.error_msg}")
+        # 检查返回状态（也可能触发编码错误）
+        try:
+            if rs.error_code != '0':
+                # 若错误信息涉及网络，则重置重试
+                if "网络" in rs.error_msg or "接收" in rs.error_msg or "连接" in rs.error_msg:
+                    print(f"⚠️ 网络错误: {rs.error_msg}，重置重试 ({attempt+1}/{MAX_RETRIES})")
+                    _BS_READY = False
+                    if attempt == MAX_RETRIES - 1:
+                        print(f"❌ 最终失败: {rs.error_msg}")
+                        return pd.DataFrame()
+                    time.sleep(1)
+                    continue
+                else:
+                    print(f"❌ 查询失败: {rs.error_msg}")
                     return pd.DataFrame()
-                time.sleep(1)
-                continue
-            else:
-                print(f"❌ 查询失败: {rs.error_msg}")
+        except Exception as e:
+            # 读取 rs.error_msg 也可能触发编码错误
+            print(f"⚠️ 读取错误信息异常: {e}，视为网络错误重试 ({attempt+1}/{MAX_RETRIES})")
+            _BS_READY = False
+            if attempt == MAX_RETRIES - 1:
                 return pd.DataFrame()
+            time.sleep(1)
+            continue
 
+        # 获取数据
         data_list = []
-        while (rs.error_code == '0') & rs.next():
-            data_list.append(rs.get_row_data())
+        try:
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
+        except Exception as e:
+            print(f"⚠️ 数据提取异常: {e}，重试 ({attempt+1}/{MAX_RETRIES})")
+            _BS_READY = False
+            if attempt == MAX_RETRIES - 1:
+                return pd.DataFrame()
+            time.sleep(1)
+            continue
 
         if not data_list:
             return pd.DataFrame()
@@ -400,10 +423,224 @@ def fetch_stock_1m_data_bs(stock_code: str, start_time: str, end_time: str) -> p
         return pd.DataFrame()
     return df.loc[start_time:end_time]
 
+
+# -------------------- 线程安全打印 --------------------
+_print_lock = threading.Lock()
+def safe_print(*args, **kwargs):
+    with _print_lock:
+        print(*args, **kwargs)
+
+# -------------------- 修改 _query_baostock（去登录，纯查询） --------------------
+# =========================================================================
+# 最终版 _query_baostock（专治解压/编码错误）
+# =========================================================================
+def _query_baostock(bs_code: str, start_date: str, end_date: str,
+                    frequency: str, adjustflag: str = "2") -> pd.DataFrame:
+    """
+    最终稳定版：支持网络错误、解压错误、编码错误的健壮重试。
+    失败次数过多时直接返回空，避免卡死。
+    """
+    global _BS_READY
+    MAX_RETRIES = 3  # 减少重试次数，快速跳过
+    for attempt in range(MAX_RETRIES):
+        try:
+            if frequency == 'd':
+                fields = "date,code,open,high,low,close,volume,amount"
+            else:
+                fields = "date,time,code,open,high,low,close,volume,amount"
+
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                fields,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=frequency,
+                adjustflag=adjustflag
+            )
+        except Exception as e:
+            error_msg = str(e)
+            # 如果是解压或编码错误，重置连接状态
+            if any(key in error_msg for key in ["decompress", "zlib", "distance", "utf-8", "unpack", "codec"]):
+                safe_print(f"⚠️ 数据解析错误（{type(e).__name__}），重置连接并重试 {attempt+1}/{MAX_RETRIES}")
+                _BS_READY = False  # 强制下次重新登录
+            else:
+                safe_print(f"⚠️ 查询异常（{type(e).__name__}）: {e}，重试 {attempt+1}/{MAX_RETRIES}")
+            if attempt == MAX_RETRIES - 1:
+                return pd.DataFrame()
+            time.sleep(1.5 ** (attempt + 1))  # 1.5, 2.25, 3.375 秒
+            continue
+
+        # 检查返回状态码
+        try:
+            if rs.error_code != '0':
+                err_msg = rs.error_msg
+                if any(key in err_msg for key in ["网络", "接收", "连接", "超时", "解压", "数据"]):
+                    safe_print(f"⚠️ 服务器错误: {err_msg}，重试 {attempt+1}/{MAX_RETRIES}")
+                    if "解压" in err_msg:
+                        _BS_READY = False
+                    if attempt == MAX_RETRIES - 1:
+                        return pd.DataFrame()
+                    time.sleep(1.5 ** (attempt + 1))
+                    continue
+                else:
+                    safe_print(f"❌ 查询失败（业务错误）: {err_msg}")
+                    return pd.DataFrame()  # 业务错误直接退出
+        except Exception as e:
+            safe_print(f"⚠️ 读取错误信息异常: {e}，视为网络错误重试 {attempt+1}/{MAX_RETRIES}")
+            if attempt == MAX_RETRIES - 1:
+                return pd.DataFrame()
+            time.sleep(1.5 ** (attempt + 1))
+            continue
+
+        # 提取数据
+        data_list = []
+        try:
+            while (rs.error_code == '0') & rs.next():
+                data_list.append(rs.get_row_data())
+        except Exception as e:
+            error_msg = str(e)
+            safe_print(f"⚠️ 数据提取异常: {error_msg}，重试 {attempt+1}/{MAX_RETRIES}")
+            if any(key in error_msg for key in ["decompress", "zlib", "distance", "utf-8"]):
+                _BS_READY = False
+            if attempt == MAX_RETRIES - 1:
+                return pd.DataFrame()
+            time.sleep(1.5 ** (attempt + 1))
+            continue
+
+        if not data_list:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data_list, columns=rs.fields)
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount'] if 'amount' in df.columns else ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df
+
+    return pd.DataFrame()
+
+# =========================================================================
+# 单只股票更新任务（单线程调用，无并发冲突）
+# =========================================================================
+def _update_single_stock_task(code: str, start_date: str, end_date: str) -> tuple:
+    """
+    处理单只股票的增量更新或首次下载（单线程安全）。
+    """
+    stock_num = code.split('.')[1]
+    cache_file = os.path.join(CACHE_DIR, f"{stock_num}.parquet")
+    status = "skipped"
+
+    try:
+        if os.path.exists(cache_file):
+            # 增量更新
+            df_existing = pd.read_parquet(cache_file)
+            if not isinstance(df_existing.index, pd.DatetimeIndex):
+                df_existing.index = pd.to_datetime(df_existing.index)
+
+            last_date = df_existing.index.max().strftime('%Y-%m-%d')
+            if last_date >= end_date:
+                status = "uptodate"
+                return (stock_num, status)
+
+            start_inc = (pd.to_datetime(last_date) + timedelta(days=1)).strftime('%Y-%m-%d')
+            safe_print(f"🔄 {stock_num}: 补充 {start_inc} ~ {end_date}")
+
+            df_new_raw = _query_baostock(code, start_inc, end_date, frequency="d", adjustflag="2")
+            if df_new_raw.empty:
+                status = "no_data"
+                return (stock_num, status)
+
+            df_new = align_baostock_to_yfinance(df_new_raw, is_minute=False)
+            if df_new.empty:
+                status = "align_fail"
+                return (stock_num, status)
+
+            df_combined = pd.concat([df_existing, df_new]).sort_index()
+            df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
+            df_combined.to_parquet(cache_file)
+            status = "updated"
+            safe_print(f"✅ {stock_num} 更新完成，现有 {len(df_combined)} 行")
+        else:
+            # 首次下载
+            safe_print(f"📥 {stock_num}: 首次全量下载 {start_date} ~ {end_date}")
+            df = fetch_stock_1d_data_bs(stock_num, start_date, end_date, adjust="qfq")
+            status = "downloaded" if not df.empty else "failed"
+
+    except Exception as e:
+        safe_print(f"⚠️ {stock_num} 处理异常: {e}")
+        status = "error"
+
+    # 单线程模式下，每次请求后固定等待 0.3 秒，有效避免服务器压力
+    time.sleep(0.3)
+    return (stock_num, status)
+
+# =========================================================================
+# 【单线程版】全市场更新（稳定优先，速度次之）
+# =========================================================================
+def update_all_stocks_incremental(start_date: str = None, end_date: str = None,
+                                  stock_list: list = None):
+    """
+    单线程全市场更新（稳定第一）。
+    参数：
+        start_date: 首次下载起始日期（默认5年前）
+        end_date: 截止日期（默认今天）
+        stock_list: 指定股票代码列表（如 ['sh.600000']），若为None则自动获取全市场
+    """
+    if end_date is None:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+    if start_date is None:
+        start_date = (datetime.now() - timedelta(days=365*5)).strftime('%Y-%m-%d')
+
+    # 1. 主线程登录
+    try:
+        _ensure_baostock_ready()
+    except Exception as e:
+        print(f"❌ Baostock 登录失败: {e}")
+        return
+
+    # 2. 获取股票列表
+    if stock_list is None:
+        print("🔄 正在获取全市场股票列表...")
+        rs = bs.query_stock_basic()
+        if rs.error_code != '0':
+            print(f"❌ 获取列表失败: {rs.error_msg}")
+            stock_list = ['sh.600000', 'sh.600036', 'sz.000001']
+            print(f"⚠️ 使用兜底列表: {stock_list}")
+        else:
+            stock_list = []
+            while (rs.error_code == '0') & rs.next():
+                code = rs.get_row_data()[0]
+                if code.startswith(('sh.', 'sz.')) and not code.startswith(('sh.000', 'sh.999')):
+                    stock_list.append(code)
+            print(f"✅ 获取到 {len(stock_list)} 只股票")
+    else:
+        print(f"📋 使用指定的 {len(stock_list)} 只股票")
+
+    if not stock_list:
+        print("❌ 无股票可更新")
+        return
+
+    print(f"🔄 开始单线程更新（稳定模式），区间 {start_date} ~ {end_date}")
+    total = len(stock_list)
+    completed = 0
+    failed_stocks = []
+
+    for code in stock_list:
+        stock_num, status = _update_single_stock_task(code, start_date, end_date)
+        completed += 1
+        if status in ["failed", "error", "no_data"]:
+            failed_stocks.append(stock_num)
+        if completed % 50 == 0:
+            print(f"⏳ 进度: {completed}/{total}，失败: {len(failed_stocks)}")
+
+    print(f"🎉 更新完成！总计 {total} 只，失败 {len(failed_stocks)} 只")
+    if failed_stocks:
+        print(f"❌ 失败列表: {failed_stocks[:10]}{'...' if len(failed_stocks)>10 else ''}")
+
 # =========================================================================
 # 7. 全市场初始化/增量更新（支持指定起始日期）
 # =========================================================================
-def update_all_stocks_incremental(start_date: str = None, end_date: str = None):
+def update_all_stocks_incremental_delete(start_date: str = None, end_date: str = None):
     """
     全市场数据初始化/增量更新（修复版：使用 query_stock_basic 获取列表）
     """
@@ -504,9 +741,19 @@ def update_all_stocks_incremental(start_date: str = None, end_date: str = None):
 # 8. 测试入口
 # =========================================================================
 if __name__ == "__main__":
+    # 指定股票列表（省去全市场扫描）
+    #my_stocks = ['sh.600983', 'sh.600984', 'sh.601169']
+    my_stocks = []
+    for stock_code in stocks_dict.keys():
+        if stock_code.startswith('6'):
+            my_stocks.append(f"sh.{stock_code}")
+        else:
+            my_stocks.append(f"sz.{stock_code}")
+
     # 执行全市场增量更新（第一次会很慢，以后每天只增量）
     print("👉 [初始化] 从 2025-01-01 开始下载全市场数据（仅演示，实际运行需谨慎）")
-    update_all_stocks_incremental(start_date="2025-01-01")  
+    #update_all_stocks_incremental(start_date="2025-01-01")  
+    update_all_stocks_incremental(start_date="2025-01-01", stock_list=my_stocks)
     #update_all_stocks_incremental() 
 
     #test_code = "688551"
