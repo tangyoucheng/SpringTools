@@ -4,6 +4,7 @@
 
 import baostock as bs
 import pandas as pd
+import time  # 需要导入 time 用于重试等待
 from datetime import datetime, timezone, timedelta
 
 # =========================================================================
@@ -105,56 +106,104 @@ def _code_to_baostock(stock_code: str) -> str:
         return f"sz.{stock_code}"
 
 # =========================================================================
-# 辅助函数：执行 Baostock 查询（自动登录/注销）
+# 【极简版】全局登录管理（不注销，进程结束自动回收）
+# =========================================================================
+_BS_READY = False
+
+def _ensure_baostock_ready():
+    """确保 Baostock 已登录（只登录一次）"""
+    global _BS_READY
+    if _BS_READY:
+        return
+    lg = bs.login()
+    if lg.error_code != '0':
+        raise ConnectionError(f"Baostock 登录失败: {lg.error_msg}")
+    _BS_READY = True
+    print("✅ Baostock 就绪 (已登录)")
+
+# =========================================================================
+# 辅助函数：执行 Baostock 查询（含自动重试与连接重置）
 # =========================================================================
 def _query_baostock(bs_code: str, start_date: str, end_date: str,
                     frequency: str, adjustflag: str = "2") -> pd.DataFrame:
     """
-    封装 Baostock 查询，返回包含原始字段的 DataFrame。
+    封装 Baostock 查询，含自动重试与连接重置。
     frequency: 'd' 日线, '5'/'15'/'30'/'60' 分钟线
     adjustflag: '2' 前复权, '3' 不复权, '1' 后复权
     """
-    lg = bs.login()
-    if lg.error_code != '0':
-        print(f"❌ Baostock 登录失败: {lg.error_msg}")
-        bs.logout()
-        return pd.DataFrame()
+    # ----- 在函数顶部声明全局变量 -----
+    global _BS_READY
 
-    # 根据频率选择字段
-    if frequency == 'd':
-        fields = "date,code,open,high,low,close,volume,amount"
-    else:
-        fields = "date,time,code,open,high,low,close,volume,amount"
+    MAX_RETRIES = 3
+    for attempt in range(MAX_RETRIES):
+        try:
+            # 1. 确保已登录（若之前失败，则会重置状态并重试）
+            _ensure_baostock_ready()
+        except Exception as e:
+            print(f"⚠️ 登录异常: {e}，重置状态重试 ({attempt+1}/{MAX_RETRIES})")
+            _BS_READY = False
+            if attempt == MAX_RETRIES - 1:
+                return pd.DataFrame()
+            time.sleep(1)
+            continue
 
-    rs = bs.query_history_k_data_plus(
-        bs_code,
-        fields,
-        start_date=start_date,
-        end_date=end_date,
-        frequency=frequency,
-        adjustflag=adjustflag
-    )
+        # 2. 构建查询字段
+        if frequency == 'd':
+            fields = "date,code,open,high,low,close,volume,amount"
+        else:
+            fields = "date,time,code,open,high,low,close,volume,amount"
 
-    if rs.error_code != '0':
-        print(f"❌ Baostock 查询失败: {rs.error_msg}")
-        bs.logout()
-        return pd.DataFrame()
+        # 3. 执行查询（捕获网络异常）
+        try:
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                fields,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=frequency,
+                adjustflag=adjustflag
+            )
+        except Exception as e:
+            print(f"⚠️ 查询过程异常: {e}，重置连接重试 ({attempt+1}/{MAX_RETRIES})")
+            _BS_READY = False
+            if attempt == MAX_RETRIES - 1:
+                return pd.DataFrame()
+            time.sleep(1)
+            continue
 
-    data_list = []
-    while (rs.error_code == '0') & rs.next():
-        data_list.append(rs.get_row_data())
-    bs.logout()
+        # 4. 检查返回状态
+        if rs.error_code != '0':
+            # 若错误信息涉及网络，则重置重试
+            if "网络" in rs.error_msg or "接收" in rs.error_msg or "连接" in rs.error_msg:
+                print(f"⚠️ 网络错误: {rs.error_msg}，重置重试 ({attempt+1}/{MAX_RETRIES})")
+                _BS_READY = False
+                if attempt == MAX_RETRIES - 1:
+                    print(f"❌ 最终失败: {rs.error_msg}")
+                    return pd.DataFrame()
+                time.sleep(1)
+                continue
+            else:
+                # 其他业务错误（如股票代码无效）直接退出
+                print(f"❌ 查询失败: {rs.error_msg}")
+                return pd.DataFrame()
 
-    if not data_list:
-        return pd.DataFrame()
+        # 5. 获取数据
+        data_list = []
+        while (rs.error_code == '0') & rs.next():
+            data_list.append(rs.get_row_data())
 
-    df = pd.DataFrame(data_list, columns=rs.fields)
-    # 转换数值列（保留字符串时间）
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount'] if 'amount' in df.columns else ['open', 'high', 'low', 'close', 'volume']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
+        if not data_list:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(data_list, columns=rs.fields)
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount'] if 'amount' in df.columns else ['open', 'high', 'low', 'close', 'volume']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        return df
+
+    # 若循环结束（理论不会执行）
+    return pd.DataFrame()
 
 # =========================================================================
 # 方法二：【全自动免参】当日实时 K线抓取（实际返回 5分钟线）
@@ -251,45 +300,43 @@ def fetch_stock_1d_raw(stock_code: str, start_date: str, end_date: str) -> pd.Da
         return pd.DataFrame()
 
 # =========================================================================
-# 【增强版】方法六：获取复权因子（若无事件则自动补全为 1.0）
+# 【增强版】方法六：获取复权因子（复用全局登录，无 login/logout 打印）
 # =========================================================================
 def fetch_stock_adj_factor(stock_code: str, start_date: str, end_date: str) -> pd.Series:
     """
-    获取指定日期范围的复权因子。如果该区间内没有除权事件，
-    则自动返回该区间全为 1.0 的因子序列（即不复权）。
+    获取指定日期范围的复权因子。如果查询失败或无除权事件，返回全 1.0 因子。
+    复用全局登录状态，不再单独 login/logout。
     """
     try:
         st_date = pd.to_datetime(start_date).strftime('%Y-%m-%d')
         ed_date = pd.to_datetime(end_date).strftime('%Y-%m-%d')
         bs_code = _code_to_baostock(stock_code)
 
-        lg = bs.login()
-        if lg.error_code != '0':
-            print(f"❌ Baostock 登录失败: {lg.error_msg}")
-            bs.logout()
-            # 返回全1序列作为兜底
+        # ----- 关键改动：使用全局登录，不再自己 login/logout -----
+        try:
+            _ensure_baostock_ready()
+        except Exception as e:
+            print(f"❌ 全局登录失败: {e}")
             date_range = pd.date_range(start=st_date, end=ed_date, freq='D')
             return pd.Series(1.0, index=date_range, name='adjust_factor')
 
         rs = bs.query_adjust_factor(bs_code, start_date=st_date, end_date=ed_date)
+
         if rs.error_code != '0':
-            print(f"❌ 复权因子查询失败: {rs.error_msg}")
-            bs.logout()
+            # 如果是网络错误，可以尝试重连（但这里简单返回全1）
+            print(f"⚠️ 复权因子查询失败: {rs.error_msg}，使用默认因子 1.0")
             date_range = pd.date_range(start=st_date, end=ed_date, freq='D')
             return pd.Series(1.0, index=date_range, name='adjust_factor')
 
         data_list = []
         while (rs.error_code == '0') & rs.next():
             data_list.append(rs.get_row_data())
-        bs.logout()
 
-        # ------------------- 核心修补点 -------------------
-        if not data_list:
-            # 如果没有查到复权因子，说明区间内无除权，直接返回全 1 序列
-            print(f"ℹ️ 提示: {start_date} 至 {end_date} 区间无除权事件，复权因子默认为 1.0")
+        # 若没有数据或字段缺失，返回全1
+        if not data_list or 'adjust_factor' not in rs.fields:
+            print(f"ℹ️ 提示: {start_date} 至 {end_date} 区间无除权事件或因子字段不存在，复权因子默认为 1.0")
             date_range = pd.date_range(start=st_date, end=ed_date, freq='D')
             return pd.Series(1.0, index=date_range, name='adjust_factor')
-        # ------------------------------------------------
 
         df = pd.DataFrame(data_list, columns=rs.fields)
         df['adjust_factor'] = pd.to_numeric(df['adjust_factor'], errors='coerce')
@@ -297,9 +344,10 @@ def fetch_stock_adj_factor(stock_code: str, start_date: str, end_date: str) -> p
         df.set_index('date', inplace=True)
         factor_series = df['adjust_factor'].dropna().sort_index()
         return factor_series
+
     except Exception as e:
         print(f"❌ [复权因子抓取失败]: {e}")
-        # 异常时也返回全1序列
+        # 异常时返回全1
         st_date = pd.to_datetime(start_date).strftime('%Y-%m-%d')
         ed_date = pd.to_datetime(end_date).strftime('%Y-%m-%d')
         date_range = pd.date_range(start=st_date, end=ed_date, freq='D')
@@ -374,7 +422,7 @@ def fetch_stock_1d_self_adj(stock_code: str, start_date: str, end_date: str) -> 
 # =========================================================================
 if __name__ == "__main__":
     test_code = "688551"
-    start_d = "2026-07-15"
+    start_d = "2025-07-15"
     end_d = "2026-07-28"
 
     print("=" * 70)
